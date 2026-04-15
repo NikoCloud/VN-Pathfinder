@@ -1,0 +1,31 @@
+# Ignore everything in the game library root by default
+*
+
+# ── Project source files ──────────────────────────────────────────────────────
+!.gitignore
+!vn_pathfinder.py
+!requirements.txt
+!LICENSE
+!README.md
+!build.bat
+!vn_pathfinder.spec
+!installer.iss
+
+# ── Project directories ───────────────────────────────────────────────────────
+!.github/
+!.github/**
+!assets/
+!assets/**
+!docs/
+!docs/**
+
+# ── Build artefacts (always excluded) ────────────────────────────────────────
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Runtime data (local only, never committed) ────────────────────────────────
+vn_pathfinder.json
+renpy_manager.json
