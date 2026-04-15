@@ -21,6 +21,28 @@ a = Analysis(
         'tkinter.ttk',
         'tkinter.filedialog',
         'tkinter.messagebox',
+        # Metadata scraping — bundled but gracefully absent at runtime if missing
+        'curl_cffi',
+        'curl_cffi.requests',
+        'bs4',
+        'lxml',
+        'lxml.etree',
+        'lxml._elementpath',
+        # pywebview — in-app browser for itch.io login
+        'webview',
+        'webview.platforms.winforms',
+        'webview.http',
+        'bottle',
+        # pythonnet / clr — needed by pywebview edgechromium backend
+        'clr',
+        'clr_loader',
+        'pythonnet',
+        # multiprocessing support for pywebview subprocess
+        'multiprocessing',
+        'multiprocessing.process',
+        'multiprocessing.queues',
+        'multiprocessing.reduction',
+        'multiprocessing.popen_spawn_win32',
     ],
     hookspath=[],
     hooksconfig={},

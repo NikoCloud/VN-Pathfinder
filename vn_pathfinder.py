@@ -12,6 +12,7 @@ import collections
 import datetime
 import itertools
 import json
+import multiprocessing
 import os
 import queue
 import re
@@ -36,6 +37,21 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    # curl_cffi impersonates Chrome's TLS fingerprint — bypasses Cloudflare
+    from curl_cffi import requests as _req  # type: ignore[import]
+    from bs4 import BeautifulSoup as _BS    # type: ignore[import]
+    HAS_SCRAPING = True
+except ImportError:
+    HAS_SCRAPING = False
+
+try:
+    import webview as _webview              # type: ignore[import]
+    HAS_WEBVIEW = True
+except ImportError:
+    HAS_WEBVIEW = False
+
+
 # ── Version ────────────────────────────────────────────────────────────────────
 
 APP_VERSION  = "1.0.0-beta"
@@ -50,17 +66,35 @@ def _resource_path(rel: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", None) or Path(__file__).parent)
     return base / rel
 
-RENPY_DIR     = Path(__file__).parent.resolve()
+# APP_DIR  — folder that contains vn_pathfinder.py / VNPathfinder.exe
+#            e.g.  F:\RenPy\_VNPathfinder\
+# RENPY_DIR — parent of APP_DIR; the actual games library root
+#            e.g.  F:\RenPy\
+if getattr(sys, "frozen", False):                     # PyInstaller bundle
+    APP_DIR = Path(sys.executable).parent.resolve()
+else:                                                  # normal Python run
+    APP_DIR = Path(__file__).parent.resolve()
+
+RENPY_DIR     = APP_DIR.parent
 APPDATA_RENPY = Path(os.environ.get("APPDATA", "")) / "RenPy"
-USERDATA_FILE = RENPY_DIR / "vn_pathfinder.json"
+USERDATA_FILE = APP_DIR / "vn_pathfinder.json"
 SETTINGS_FILE = Path(os.environ.get("APPDATA", "")) / "VN Pathfinder" / "settings.json"
 ASSETS_DIR    = _resource_path("assets")
 
-# ── Data file migration (renpy_manager.json → vn_pathfinder.json) ──────────────
-_OLD_USERDATA = RENPY_DIR / "renpy_manager.json"
-if _OLD_USERDATA.exists() and not USERDATA_FILE.exists():
+# ── Data file migrations ───────────────────────────────────────────────────────
+# v1: renpy_manager.json → vn_pathfinder.json
+for _old in (APP_DIR / "renpy_manager.json", RENPY_DIR / "renpy_manager.json"):
+    if _old.exists() and not USERDATA_FILE.exists():
+        try:
+            _old.rename(USERDATA_FILE)
+        except OSError:
+            pass
+
+# v2: vn_pathfinder.json in games root → app subfolder  (post-reorganisation)
+_old_root_data = RENPY_DIR / "vn_pathfinder.json"
+if _old_root_data.exists() and not USERDATA_FILE.exists():
     try:
-        _OLD_USERDATA.rename(USERDATA_FILE)
+        _old_root_data.rename(USERDATA_FILE)
     except OSError:
         pass
 
@@ -88,12 +122,26 @@ VERSION_RE = re.compile(
 )
 
 ART_CANDIDATES = [
+    # .vnpf/ metadata cover comes first so it takes priority over in-game art
+    "../.vnpf/cover.jpg",
+    "../.vnpf/cover.png",
     "gui/main_menu.png",
     "gui/main_menu.jpg",
     "gui/game_menu.png",
     "gui/game_menu.jpg",
     "gui/window_icon.png",
 ]
+
+# ── Metadata scraping constants ────────────────────────────────────────────────
+
+VNDB_API_URL    = "https://api.vndb.org/kana/vn"
+F95_BASE        = "https://f95zone.to"
+LC_BASE         = "https://lewdcorner.com"
+ITCHIO_BASE     = "https://itch.io"
+METADATA_DIR    = ".vnpf"
+METADATA_FILE   = "metadata.json"
+SCRAPER_UA      = f"VN-Pathfinder/{APP_VERSION} (https://github.com/NikoCloud/VN-Pathfinder)"
+SCRAPER_TIMEOUT = 15  # seconds
 
 # ── Tag catalogue ──────────────────────────────────────────────────────────────
 
@@ -172,6 +220,21 @@ def save_settings(data: dict) -> None:
         pass
 
 
+def _set_lib_dir(path: Path) -> None:
+    """Override the global library directory at runtime (called after settings load)."""
+    global RENPY_DIR
+    RENPY_DIR = path
+
+
+# Settings key defaults — used in SettingsDialog and net_ok()
+_SETTINGS_DEFAULTS: dict[str, object] = {
+    "check_updates":        True,
+    "fetch_metadata":       True,
+    "allow_provider_login": True,
+    "lockdown":             True,   # ON by default; persists once user disables it
+}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA CLASSES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -186,6 +249,34 @@ class GameVersion:
     exe_path: Path | None
     local_save_dir: Path
     appdata_save_dir: Path | None = None
+    metadata: dict             = field(default_factory=dict)
+    is_renpy: bool             = True
+
+
+@dataclass
+class MetadataCandidate:
+    """A single search result returned by a provider before the user picks one."""
+    source:    str          # "vndb" | "f95zone" | "lewdcorner"
+    title:     str
+    url:       str
+    developer: str = ""
+    synopsis:  str = ""
+    cover_url: str = ""
+    tags:      list[str] = field(default_factory=list)
+    extra:     dict      = field(default_factory=dict)   # source-specific raw fields
+
+
+@dataclass
+class MetadataResult:
+    """Aggregated result for one source after the user selects a candidate."""
+    source:    str
+    title:     str
+    url:       str
+    developer: str = ""
+    synopsis:  str = ""
+    cover_url: str = ""
+    tags:      list[str] = field(default_factory=list)
+    extra:     dict      = field(default_factory=dict)
 
 
 @dataclass
@@ -227,11 +318,31 @@ class UserData:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_game_dir(path: Path) -> bool:
+    """True for RenPy game folders (game/ subdir or *.py launcher)."""
     if not path.is_dir():
         return False
     if (path / "game").is_dir():
         return True
     return any(path.glob("*.py"))
+
+
+def is_exe_game_dir(path: Path) -> bool:
+    """True for non-RenPy folders that contain a .exe at root or one level deep."""
+    if not path.is_dir():
+        return False
+    if is_game_dir(path):
+        return False   # already handled as RenPy
+    # Direct .exe in the folder
+    if any(path.glob("*.exe")):
+        return True
+    # One subfolder that itself contains a .exe (common bundled structure)
+    try:
+        subdirs = [d for d in path.iterdir() if d.is_dir()]
+        if len(subdirs) == 1:
+            return any(subdirs[0].glob("*.exe"))
+    except OSError:
+        pass
+    return False
 
 
 def _strip_platform(tokens: list[str]) -> list[str]:
@@ -364,7 +475,9 @@ def saves_location(version: GameVersion, ud: UserData) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def scan_game_version(path: Path) -> GameVersion | None:
-    if not is_game_dir(path):
+    renpy = is_game_dir(path)
+    non_renpy = (not renpy) and is_exe_game_dir(path)
+    if not renpy and not non_renpy:
         return None
     base_key, version_str, display_name = parse_folder_name(path.name)
     if not base_key:
@@ -374,6 +487,17 @@ def scan_game_version(path: Path) -> GameVersion | None:
         if "-32" not in p.stem:
             exe_path = p
             break
+    # For non-RenPy games bundled one folder deep, find the exe there
+    if not exe_path and not renpy:
+        try:
+            subdirs = [d for d in path.iterdir() if d.is_dir()]
+            if len(subdirs) == 1:
+                for p in sorted(subdirs[0].glob("*.exe")):
+                    if "-32" not in p.stem:
+                        exe_path = p
+                        break
+        except OSError:
+            pass
     return GameVersion(
         folder_name=path.name,
         folder_path=path,
@@ -382,7 +506,9 @@ def scan_game_version(path: Path) -> GameVersion | None:
         display_name=display_name,
         exe_path=exe_path,
         local_save_dir=path / "game" / "saves",
-        appdata_save_dir=resolve_appdata(path, base_key),
+        appdata_save_dir=resolve_appdata(path, base_key) if renpy else None,
+        metadata=load_game_metadata(path),
+        is_renpy=renpy,
     )
 
 
@@ -561,6 +687,12 @@ def _group_art_path(g: GameGroup, ud: UserData) -> Path | None:
         p = Path(ca)
         if p.exists():
             return p
+    # .vnpf/ cover takes priority over in-game art
+    for v in reversed(g.versions):
+        for ext in ("cover.jpg", "cover.png"):
+            vnpf_cover = _vnpf_dir(v.folder_path) / ext
+            if vnpf_cover.exists():
+                return vnpf_cover
     for v in reversed(g.versions):
         p = find_art_path(v.folder_path)
         if p:
@@ -581,6 +713,678 @@ def _pil_load(path: Path, w: int, h: int):
         y = (h - img.height) // 2
         bg.paste(img, (x, y))
         return bg.copy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METADATA HELPERS  (.vnpf/ storage)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _vnpf_dir(folder_path: Path) -> Path:
+    return folder_path / METADATA_DIR
+
+
+def load_game_metadata(folder_path: Path) -> dict:
+    """Read .vnpf/metadata.json; return empty dict on any error."""
+    try:
+        with open(_vnpf_dir(folder_path) / METADATA_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_game_metadata(folder_path: Path, meta: dict) -> None:
+    d = _vnpf_dir(folder_path)
+    d.mkdir(exist_ok=True)
+    with open(d / METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+def _download_cover(url: str, folder_path: Path) -> Path | None:
+    """Download cover art to .vnpf/cover.jpg (or .png). Returns saved path."""
+    if not HAS_SCRAPING or not url:
+        return None
+    try:
+        ext = ".png" if url.lower().endswith(".png") else ".jpg"
+        dest = _vnpf_dir(folder_path) / f"cover{ext}"
+        _vnpf_dir(folder_path).mkdir(exist_ok=True)
+        headers = {"User-Agent": SCRAPER_UA}
+        resp = _req.get(url, headers=headers, timeout=SCRAPER_TIMEOUT, stream=True)
+        resp.raise_for_status()
+        with open(dest, "wb") as fh:
+            for chunk in resp.iter_content(65536):
+                fh.write(chunk)
+        return dest
+    except Exception:
+        return None
+
+
+def _strip_bbcode(text: str) -> str:
+    """Remove common BBCode tags from a string."""
+    text = re.sub(r"\[/?(?:b|i|u|s|url|img|color|size|spoiler|quote)[^\]]*\]",
+                  "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METADATA PROVIDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Per-site cookie storage ────────────────────────────────────────────────────
+
+COOKIE_FILE = Path(os.environ.get("APPDATA", "")) / "VN Pathfinder" / "cookies.json"
+
+def load_site_cookies(site: str) -> dict:
+    """Return saved cookies for a site key, or empty dict."""
+    try:
+        with open(COOKIE_FILE, encoding="utf-8") as f:
+            return json.load(f).get(site, {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_site_cookies(site: str, cookies: dict) -> None:
+    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing: dict = {}
+        try:
+            with open(COOKIE_FILE, encoding="utf-8") as f:
+                existing = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+        existing[site] = cookies
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+    except OSError:
+        pass
+
+def _cffi_get(url: str, cookies: dict | None = None,
+              timeout: int = SCRAPER_TIMEOUT) -> "object":
+    """GET via curl_cffi impersonating Chrome. Raises on non-2xx.
+    NOTE: do NOT pass a custom User-Agent — impersonate= sets the correct
+    Chrome UA automatically. Overriding it breaks the Cloudflare bypass.
+    """
+    return _req.get(
+        url,
+        impersonate="chrome131",
+        cookies=cookies or {},
+        timeout=timeout,
+    )
+
+def _cffi_post(url: str, json_body: dict,
+               timeout: int = SCRAPER_TIMEOUT) -> "object":
+    """POST via curl_cffi impersonating Chrome."""
+    return _req.post(
+        url,
+        impersonate="chrome131",
+        json=json_body,
+        headers={"User-Agent": SCRAPER_UA, "Content-Type": "application/json"},
+        timeout=timeout,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METADATA PROVIDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VNDBProvider:
+    """Query VNDB public API v2 (no auth required)."""
+
+    SOURCE = "vndb"
+
+    def search(self, title: str) -> list[MetadataCandidate]:
+        if not HAS_SCRAPING:
+            raise RuntimeError("curl_cffi/bs4 not installed")
+        payload = {
+            "filters": ["search", "=", title],
+            "fields": (
+                "title,alttitle,released,developers.name,"
+                "description,image.url,image.sexual,tags.name,tags.spoiler"
+            ),
+            "results": 10,
+            "sort": "searchrank",
+        }
+        resp = _cffi_post(VNDB_API_URL, payload)
+        resp.raise_for_status()
+        data = resp.json()
+        results: list[MetadataCandidate] = []
+        for item in data.get("results", []):
+            vid   = item.get("id", "")
+            url   = f"https://vndb.org/{vid}"
+            devs  = [d["name"] for d in item.get("developers", []) if d.get("name")]
+            # Filter out spoiler tags and keep only non-sexual images
+            tags  = [t["name"] for t in item.get("tags", [])
+                     if t.get("name") and not t.get("spoiler")]
+            raw_synopsis = _strip_bbcode(item.get("description") or "")
+            cover = ""
+            img = item.get("image") or {}
+            if img.get("url"):
+                cover = img["url"]
+            results.append(MetadataCandidate(
+                source=self.SOURCE,
+                title=item.get("title", ""),
+                url=url,
+                developer=", ".join(devs),
+                synopsis=raw_synopsis,
+                cover_url=cover,
+                tags=tags,
+                extra={"vndb_id": vid, "released": item.get("released", "")},
+            ))
+        return results
+
+
+class F95ZoneProvider:
+    """
+    Scrape F95Zone using curl_cffi (Chrome TLS impersonation) + session cookies.
+    Users must supply their xf_user + xf_session cookies from a logged-in browser
+    session for adult content to be visible.
+    """
+
+    SOURCE = "f95zone"
+    # XenForo search endpoint
+    _SEARCH_URL = f"{F95_BASE}/search/search/"
+
+    def _cookies(self) -> dict:
+        return load_site_cookies("f95zone")
+
+    def search(self, title: str) -> list[MetadataCandidate]:
+        if not HAS_SCRAPING:
+            raise RuntimeError("curl_cffi/bs4 not installed")
+        cookies = self._cookies()
+        if not cookies:
+            raise RuntimeError(
+                "Not logged in to F95Zone.\n"
+                "Use the '⬇ Fetch…' dialog → 'Configure site login' to log in.")
+        # XenForo search: POST to /search/search/
+        from urllib.parse import urlencode
+        params = urlencode({
+            "keywords": title,
+            "t":        "post",
+            "o":        "relevance",
+            "c[nodes][0]": "2",          # Games/Comics node
+            "c[child_nodes]": "1",
+            "c[title_only]": "1",
+        })
+        url = f"{self._SEARCH_URL}?{params}"
+        resp = _cffi_get(url, cookies=cookies)
+        resp.raise_for_status()
+        soup = _BS(resp.text, "lxml")
+
+        # Detect login wall
+        if soup.select_one("form.js-loginForm, .blockMessage--login"):
+            raise RuntimeError(
+                "F95Zone session expired. Log in again via '⬇ Fetch…' → "
+                "'Configure site login'.")
+
+        results: list[MetadataCandidate] = []
+        for item in soup.select("li.block-row")[:8]:
+            a = item.select_one("h3.contentRow-title a, .contentRow-title a")
+            if not a:
+                continue
+            href = a.get("href", "")
+            if not href.startswith("http"):
+                href = F95_BASE + href
+            snippet_el = item.select_one(".contentRow-snippet")
+            excerpt = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            # Strip F95Zone's [Engine][Version][Dev] bracket convention from
+            # search-result titles so cards show a clean name
+            raw = a.get_text(separator=" ", strip=True)
+            clean = re.sub(r"\s*\[[^\]]+\]", "", raw).strip() or raw
+            results.append(MetadataCandidate(
+                source=self.SOURCE,
+                title=clean,
+                url=href,
+                synopsis=excerpt,
+            ))
+        return results
+
+    def fetch_thread(self, url: str) -> MetadataCandidate:
+        cookies = self._cookies()
+        resp = _cffi_get(url, cookies=cookies)
+        resp.raise_for_status()
+        soup = _BS(resp.text, "lxml")
+
+        # Title — F95Zone format: "[Engine] Title [Version] [Developer]"
+        # The H1 contains a child <a class="labelLink"> with the engine/category
+        # label ("Ren'Py", "RPGM", …).  get_text() with no separator would jam
+        # that label directly onto the game name, giving "Ren'PyGame Name".
+        # Fix: collect only the direct NavigableString children of the H1,
+        # which contain the actual title text (the <a> child's text is skipped).
+        from bs4 import NavigableString as _NST
+        raw_title = ""
+        title_el = soup.select_one("h1.p-title-value")
+        if title_el:
+            parts = [str(t).strip() for t in title_el.children
+                     if isinstance(t, _NST) and str(t).strip()]
+            raw_title = " ".join(parts)
+            if not raw_title:           # fallback: separator-joined full text
+                raw_title = title_el.get_text(separator=" ", strip=True)
+        # Extract developer from last bracket pair
+        developer = ""
+        dev_m = re.search(r"\[([^\]]+)\]\s*$", raw_title)
+        if dev_m:
+            developer = dev_m.group(1)
+        # Clean title: strip all [brackets]
+        clean_title = re.sub(r"\s*\[[^\]]+\]", "", raw_title).strip()
+
+        # First post body — try multiple selectors (F95 structure varies)
+        body_el = (
+            soup.select_one("article.message--first .bbWrapper") or
+            soup.select_one(".message-body .bbWrapper") or
+            soup.select_one(".bbWrapper")
+        )
+        synopsis = cover_url = ""
+        tags: list[str] = []
+
+        if body_el:
+            # Cover: first sizeable image; F95 uses lazy-load data-src
+            for img_el in body_el.select("img[src], img[data-src]"):
+                src = img_el.get("src") or img_el.get("data-src", "")
+                if (src and src.startswith("http")
+                        and "smilies" not in src and "emoji" not in src):
+                    cover_url = src
+                    break
+            # Synopsis: first paragraph with real text
+            for el in body_el.select("p, div"):
+                t = el.get_text(" ", strip=True)
+                if len(t) > 80 and not t.startswith("["):
+                    synopsis = t
+                    break
+            # Developer: look for "Developer:" label in post body as a more
+            # reliable source than the title bracket (title may omit it)
+            if not developer:
+                for bold in body_el.select("b, strong"):
+                    if "developer" in bold.get_text(strip=True).lower():
+                        # Text immediately after the label (strip icon links)
+                        parent = bold.parent
+                        if parent:
+                            raw = parent.get_text(" ", strip=True)
+                            m = re.search(
+                                r"[Dd]eveloper\s*[:\-]\s*([^\n\r|/\\]{2,60})",
+                                raw)
+                            if m:
+                                # Trim trailing link-noise like "Itch.io Instagram…"
+                                dev_raw = m.group(1).strip()
+                                developer = re.split(
+                                    r"\s{2,}|\s(?:Itch|Patreon|Twitter|Discord"
+                                    r"|Instagram|Subscribestar|Boosty|Buy\b)",
+                                    dev_raw)[0].strip()
+                        break
+
+        # Tags — try header tag links first, then Genre field in post body
+        # XenForo can put tagItem on the <li> OR the <a> depending on theme
+        for sel in (
+            ".p-description a.tagItem",
+            "li.tagItem a",
+            "a.tagItem",
+            "ul.tagList li a",
+            ".tagList a",
+        ):
+            found = [el.get_text(strip=True) for el in soup.select(sel)
+                     if el.get_text(strip=True)]
+            if found:
+                tags = found
+                break
+
+        # Fallback: Genre field in the post body
+        # F95 formats:
+        #   <b>Genre</b>: [SPOILER]3dcg, Female protagonist, ...[/SPOILER]
+        #   <b>Genre</b>: 3dcg, Female protagonist, ... (no spoiler)
+        if not tags and body_el:
+            for bold in body_el.select("b, strong"):
+                if "genre" in bold.get_text(strip=True).lower():
+                    # Strategy 1: Genre in a spoiler block
+                    spoiler = bold.find_next(
+                        "div", class_=lambda c: c and "bbCodeSpoiler" in c)
+                    if spoiler:
+                        # Use the inner content div — outer div includes button text ("Spoiler")
+                        inner = (
+                            spoiler.select_one(".bbCodeSpoiler-content") or
+                            spoiler.select_one(".bbCodeBlock-content") or
+                            spoiler
+                        )
+                        raw = inner.get_text(", ", strip=True)
+                        tags = [t.strip() for t in re.split(r"[,\n]+", raw) if t.strip()]
+
+                    # Strategy 2: Genre as inline text on the same line (no spoiler)
+                    if not tags:
+                        parent = bold.parent
+                        if parent:
+                            full = parent.get_text(" ", strip=True)
+                            m = re.search(r"[Gg]enre\s*[:\-]\s*(.+)", full)
+                            if m:
+                                raw = m.group(1).strip()
+                                tags = [t.strip() for t in re.split(r"[,\n]+", raw)
+                                        if t.strip()]
+                    break
+
+        return MetadataCandidate(
+            source=self.SOURCE,
+            title=clean_title,
+            url=url,
+            developer=developer,
+            synopsis=synopsis,
+            cover_url=cover_url,
+            tags=tags,
+        )
+
+
+class LewdCornerProvider:
+    """
+    Scrape LewdCorner.com — runs XenForo, same structure as F95Zone.
+    """
+
+    SOURCE = "lewdcorner"
+    _SEARCH_URL = f"{LC_BASE}/search/search/"
+
+    def _cookies(self) -> dict:
+        return load_site_cookies("lewdcorner")
+
+    def search(self, title: str) -> list[MetadataCandidate]:
+        if not HAS_SCRAPING:
+            raise RuntimeError("curl_cffi/bs4 not installed")
+        cookies = self._cookies()
+        if not cookies:
+            raise RuntimeError(
+                "Not logged in to Lewd Corner.\n"
+                "Use '⬇ Fetch…' → 'Configure site login' to log in.")
+        from urllib.parse import urlencode
+        params = urlencode({
+            "keywords":        title,
+            "t":               "post",
+            "o":               "relevance",
+            "c[nodes][0]":     "6",   # LC "Games" node — parent of all game sub-forums
+            "c[child_nodes]":  "1",   # recursively includes Games+, AI Games, Ports, etc.
+            "c[title_only]":   "1",
+        })
+        url = f"{self._SEARCH_URL}?{params}"
+        resp = _cffi_get(url, cookies=cookies)
+        resp.raise_for_status()
+        soup = _BS(resp.text, "lxml")
+
+        if soup.select_one("form.js-loginForm, .blockMessage--login"):
+            raise RuntimeError(
+                "Lewd Corner session expired. Log in again via '⬇ Fetch…'.")
+
+        results: list[MetadataCandidate] = []
+        for item in soup.select("li.block-row")[:8]:
+            a = item.select_one("h3.contentRow-title a, .contentRow-title a")
+            if not a:
+                continue
+            href = a.get("href", "")
+            if not href.startswith("http"):
+                href = LC_BASE + href
+            snippet_el = item.select_one(".contentRow-snippet")
+            excerpt = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            raw = a.get_text(separator=" ", strip=True)
+            clean = re.sub(r"\s*\[[^\]]+\]", "", raw).strip() or raw
+            results.append(MetadataCandidate(
+                source=self.SOURCE,
+                title=clean,
+                url=href,
+                synopsis=excerpt,
+            ))
+        return results
+
+    def fetch_thread(self, url: str) -> MetadataCandidate:
+        cookies = self._cookies()
+        resp = _cffi_get(url, cookies=cookies)
+        resp.raise_for_status()
+        soup = _BS(resp.text, "lxml")
+
+        # Title — same bracket format as F95Zone: [Engine] Title [Version] [Dev]
+        # Same labelLink <a> child issue; use NavigableString children only.
+        from bs4 import NavigableString as _NST
+        raw_title = ""
+        title_el = soup.select_one("h1.p-title-value")
+        if title_el:
+            parts = [str(t).strip() for t in title_el.children
+                     if isinstance(t, _NST) and str(t).strip()]
+            raw_title = " ".join(parts)
+            if not raw_title:
+                raw_title = title_el.get_text(separator=" ", strip=True)
+        developer = ""
+        dev_m = re.search(r"\[([^\]]+)\]\s*$", raw_title)
+        if dev_m:
+            developer = dev_m.group(1)
+        clean_title = re.sub(r"\s*\[[^\]]+\]", "", raw_title).strip()
+
+        body_el = (
+            soup.select_one("article.message--first .bbWrapper") or
+            soup.select_one(".message-body .bbWrapper") or
+            soup.select_one(".bbWrapper")
+        )
+        synopsis = cover_url = ""
+        tags: list[str] = []
+
+        if body_el:
+            for img_el in body_el.select("img[src], img[data-src]"):
+                src = img_el.get("src") or img_el.get("data-src", "")
+                if src and src.startswith("http") and "smilies" not in src:
+                    cover_url = src
+                    break
+            for el in body_el.select("p, div"):
+                t = el.get_text(" ", strip=True)
+                if len(t) > 80 and not t.startswith("["):
+                    synopsis = t
+                    break
+            if not developer:
+                for bold in body_el.select("b, strong"):
+                    if "developer" in bold.get_text(strip=True).lower():
+                        parent = bold.parent
+                        if parent:
+                            raw = parent.get_text(" ", strip=True)
+                            m = re.search(
+                                r"[Dd]eveloper\s*[:\-]\s*([^\n\r|/\\]{2,60})", raw)
+                            if m:
+                                developer = m.group(1).strip().split("  ")[0].strip()
+                        break
+
+        for sel in (
+            ".p-description a.tagItem",
+            "li.tagItem a",
+            "a.tagItem",
+            "ul.tagList li a",
+            ".tagList a",
+        ):
+            found = [el.get_text(strip=True) for el in soup.select(sel)
+                     if el.get_text(strip=True)]
+            if found:
+                tags = found
+                break
+        if not tags and body_el:
+            for bold in body_el.select("b, strong"):
+                if "genre" in bold.get_text(strip=True).lower():
+                    spoiler = bold.find_next(
+                        "div", class_=lambda c: c and "bbCodeSpoiler" in c)
+                    if spoiler:
+                        inner = (
+                            spoiler.select_one(".bbCodeSpoiler-content") or
+                            spoiler.select_one(".bbCodeBlock-content") or
+                            spoiler
+                        )
+                        raw = inner.get_text(", ", strip=True)
+                        tags = [t.strip() for t in re.split(r"[,\n]+", raw) if t.strip()]
+                    if not tags:
+                        parent = bold.parent
+                        if parent:
+                            full = parent.get_text(" ", strip=True)
+                            m = re.search(r"[Gg]enre\s*[:\-]\s*(.+)", full)
+                            if m:
+                                raw = m.group(1).strip()
+                                tags = [t.strip() for t in re.split(r"[,\n]+", raw)
+                                        if t.strip()]
+                    break
+
+        return MetadataCandidate(
+            source=self.SOURCE,
+            title=clean_title or raw_title,
+            url=url,
+            developer=developer,
+            synopsis=synopsis,
+            cover_url=cover_url,
+            tags=tags,
+        )
+
+
+class ItchioProvider:
+    """
+    Scrape itch.io search and game pages.
+    No login needed for general content; cookies enable 18+ results.
+    """
+
+    SOURCE = "itchio"
+
+    def _cookies(self) -> dict:
+        return load_site_cookies("itchio")
+
+    def search(self, title: str) -> list[MetadataCandidate]:
+        if not HAS_SCRAPING:
+            raise RuntimeError("curl_cffi/bs4 not installed")
+        from urllib.parse import quote_plus
+        # Search scoped to games; logged-in cookies surface adult results
+        url = f"{ITCHIO_BASE}/search?q={quote_plus(title)}&type=games"
+        resp = _cffi_get(url, cookies=self._cookies())
+        resp.raise_for_status()
+        soup = _BS(resp.text, "lxml")
+
+        results: list[MetadataCandidate] = []
+        for cell in soup.select(".game_cell")[:10]:
+            link = cell.select_one("a.game_link, a.title")
+            if not link:
+                continue
+            href = link.get("href", "")
+            if not href.startswith("http"):
+                href = ITCHIO_BASE + href
+
+            title_el  = cell.select_one(".title, .game_title")
+            author_el = cell.select_one(".game_author")
+            img_el    = cell.select_one("img.lazy_image, img[data-src], img[src]")
+            desc_el   = cell.select_one(".game_text, .short_text")
+
+            cover = ""
+            if img_el:
+                cover = img_el.get("data-src") or img_el.get("src", "")
+
+            results.append(MetadataCandidate(
+                source=self.SOURCE,
+                title=title_el.get_text(strip=True) if title_el else "",
+                url=href,
+                developer=author_el.get_text(strip=True).lstrip("by ") if author_el else "",
+                synopsis=desc_el.get_text(" ", strip=True) if desc_el else "",
+                cover_url=cover,
+            ))
+        return results
+
+    def fetch_thread(self, url: str) -> MetadataCandidate:
+        resp = _cffi_get(url, cookies=self._cookies())
+        resp.raise_for_status()
+        soup = _BS(resp.text, "lxml")
+
+        title_el = soup.select_one("h1.game_title, h1.title")
+        title = title_el.get_text(strip=True) if title_el else ""
+
+        author_el = soup.select_one(".user_name a, .creator_name")
+        developer = author_el.get_text(strip=True) if author_el else ""
+
+        # Cover: og:image is the most reliable
+        cover_url = ""
+        og = soup.select_one('meta[property="og:image"]')
+        if og:
+            cover_url = og.get("content", "")
+        if not cover_url:
+            img_el = soup.select_one(".screenshot_list img, .header_image img")
+            if img_el:
+                cover_url = img_el.get("src", "")
+
+        # Synopsis: first substantial paragraph in the description
+        synopsis = ""
+        for el in soup.select(".formatted_description p, .game_description p"):
+            t = el.get_text(" ", strip=True)
+            if len(t) > 60:
+                synopsis = t
+                break
+
+        # Tags
+        tags: list[str] = []
+        for tag_el in soup.select(".game_tags a, .tags a"):
+            t = tag_el.get_text(strip=True)
+            if t and t not in tags:
+                tags.append(t)
+
+        return MetadataCandidate(
+            source=self.SOURCE,
+            title=title,
+            url=url,
+            developer=developer,
+            synopsis=synopsis,
+            cover_url=cover_url,
+            tags=tags,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METADATA FETCHER  (parallel background threads)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PROVIDERS: dict[str, object] = {
+    "vndb":       VNDBProvider(),
+    "itchio":     ItchioProvider(),
+    "f95zone":    F95ZoneProvider(),
+    "lewdcorner": LewdCornerProvider(),
+}
+
+SOURCE_LABELS = {
+    "vndb":       "VNDB",
+    "itchio":     "itch.io",
+    "f95zone":    "F95Zone",
+    "lewdcorner": "Lewd Corner",
+}
+
+
+class MetadataFetcher:
+    """Run provider searches in parallel threads; deliver results via callback."""
+
+    def __init__(
+        self,
+        title: str,
+        sources: list[str],
+        on_result: "Callable[[str, list[MetadataCandidate] | Exception], None]",
+        on_done:   "Callable[[], None]",
+    ) -> None:
+        self._title     = title
+        self._sources   = sources
+        self._on_result = on_result
+        self._on_done   = on_done
+        self._threads: list[threading.Thread] = []
+        self._remaining = len(sources)
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        for src in self._sources:
+            t = threading.Thread(target=self._fetch, args=(src,), daemon=True)
+            self._threads.append(t)
+            t.start()
+
+    def _fetch(self, source: str) -> None:
+        provider = _PROVIDERS.get(source)
+        try:
+            if provider is None:
+                raise RuntimeError(f"Unknown source: {source}")
+            candidates = provider.search(self._title)  # type: ignore[attr-defined]
+            # Eagerly enrich the top result so auto-assignment has real data.
+            # Other results are enriched lazily when the user selects them.
+            if candidates and hasattr(provider, "fetch_thread"):
+                try:
+                    candidates[0] = provider.fetch_thread(candidates[0].url)
+                except Exception:
+                    pass  # keep shallow on network/parse error
+            self._on_result(source, candidates)
+        except Exception as exc:
+            self._on_result(source, exc)
+        finally:
+            with self._lock:
+                self._remaining -= 1
+                if self._remaining == 0:
+                    self._on_done()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -820,6 +1624,9 @@ class ScrollableCardList(ttk.Frame):
         if selected_key and selected_key in self._cards:
             self._cards[selected_key].set_selected(True)
 
+        # Always reset scroll to top when the list is rebuilt
+        self.canvas.yview_moveto(0.0)
+
     def _on_thumb_ready(self, base_key: str, photo) -> None:
         card = self._cards.get(base_key)
         if card and card.winfo_exists():
@@ -831,13 +1638,22 @@ class ScrollableCardList(ttk.Frame):
             card.refresh_data(ud)
 
     def scroll_to(self, base_key: str) -> None:
+        """Scroll only if the card is not already fully visible."""
         card = self._cards.get(base_key)
         if not card:
             return
         self.update_idletasks()
         total = self.inner.winfo_height()
-        if total > 0:
-            self.canvas.yview_moveto(card.winfo_y() / total)
+        if total <= 0:
+            return
+        card_top    = card.winfo_y()
+        card_bottom = card_top + card.winfo_height()
+        view_top, view_bottom = self.canvas.yview()
+        vis_top    = view_top    * total
+        vis_bottom = view_bottom * total
+        if card_top >= vis_top and card_bottom <= vis_bottom:
+            return   # already fully visible — don't move
+        self.canvas.yview_moveto(card_top / total)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -918,6 +1734,8 @@ class GameCard(tk.Frame):
             sub += f"  ·  {fmt_date(lp_str)}"
         elif not any(detect_played(v, ud) for v in g.versions):
             sub += "  ·  Never played"
+        if g.versions and not g.versions[-1].is_renpy:
+            sub += "  ·  [EXE]"
         self._sub_lbl.configure(text=sub)
         # Total playtime
         total = sum(ud.playtime.get(v.folder_name, 0) for v in g.versions)
@@ -958,6 +1776,547 @@ class GameCard(tk.Frame):
         for w in tf.winfo_children():
             w.configure(bg=c)
         self._dot.configure(bg=c)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METADATA DIALOGS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FetchProgressDialog(tk.Toplevel):
+    """
+    Non-blocking progress window shown while providers are queried.
+    Closes automatically when all sources have responded; the caller
+    can also call .destroy() to cancel in-flight requests.
+    """
+
+    def __init__(self, parent, title: str, sources: list[str]) -> None:
+        super().__init__(parent)
+        self.title("Fetching Metadata")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        tk.Label(self, bg=BG, fg=FG, text=f'Searching for "{title}"',
+                 font=("Segoe UI", 10, "bold"), padx=16, pady=10).pack()
+
+        self._rows: dict[str, tk.Label] = {}
+        for src in sources:
+            row = tk.Frame(self, bg=BG, padx=16)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, bg=BG, fg=FG_DIM,
+                     text=SOURCE_LABELS.get(src, src) + ":",
+                     font=("Segoe UI", 9), width=14, anchor="w").pack(side="left")
+            lbl = tk.Label(row, bg=BG, fg=YELLOW, text="…searching",
+                           font=("Segoe UI", 9), anchor="w")
+            lbl.pack(side="left")
+            self._rows[src] = lbl
+
+        ttk.Button(self, text="Cancel", command=self.destroy).pack(pady=(6, 12))
+
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{px}+{py}")
+
+    def set_status(self, source: str, text: str, color: str = FG) -> None:
+        lbl = self._rows.get(source)
+        if lbl and lbl.winfo_exists():
+            lbl.configure(text=text, fg=color)
+
+
+class MetadataPickerDialog(tk.Toplevel):
+    """
+    Full metadata picker: shows candidates per source, lets the user
+    choose which source provides each field, then saves to .vnpf/.
+    """
+
+    # Fields the user can assign per-source
+    _FIELDS = ["title", "developer", "synopsis", "cover_art", "tags"]
+    _FIELD_LABELS = {
+        "title":     "Title",
+        "developer": "Developer",
+        "synopsis":  "Synopsis",
+        "cover_art": "Cover Art",
+        "tags":      "Tags",
+    }
+
+    def __init__(self, parent, version: "GameVersion", app: "LibraryApp") -> None:
+        super().__init__(parent)
+        self.title("Metadata — " + version.display_name)
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.geometry("900x640")
+
+        self._version  = version
+        self._app      = app
+        self._selected_candidate: dict[str, MetadataCandidate | None] = {}
+        self._preview_url: str = ""  # currently loaded cover URL in preview
+
+        # Per-field source: stores SOURCE KEY (e.g. "vndb"), not display label
+        self._field_source: dict[str, str] = {f: "" for f in self._FIELDS}
+        # Ordered list of available source keys for combo indexing
+        self._combo_keys: list[str] = []
+
+        self._build()
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{max(0,px)}+{max(0,py)}")
+
+    # ── Layout ───────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        # ── Top bar ──────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=BG2, padx=10, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, bg=BG2, fg=ACCENT,
+                 text=f"Metadata for: {self._version.display_name}",
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+
+        btn_bar = tk.Frame(top, bg=BG2)
+        btn_bar.pack(side="right")
+        self._save_btn = ttk.Button(btn_bar, text="Save", style="Accent.TButton",
+                                    command=self._save)
+        self._save_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(btn_bar, text="Cancel",
+                   command=self.destroy).pack(side="left")
+
+        # ── Two-column PanedWindow ────────────────────────────────────────────
+        paned = ttk.PanedWindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=10, pady=8)
+        self._paned = paned
+
+        # Left panel: scrollable source columns
+        left = ttk.Frame(paned)
+        paned.add(left, weight=3)
+
+        src_canvas = tk.Canvas(left, bg=BG, highlightthickness=0)
+        src_canvas.pack(side="left", fill="both", expand=True)
+        vsb = ttk.Scrollbar(left, orient="vertical", command=src_canvas.yview)
+        vsb.pack(side="right", fill="y")
+        src_canvas.configure(yscrollcommand=vsb.set)
+        src_inner = tk.Frame(src_canvas, bg=BG)
+        src_canvas.create_window((0, 0), window=src_inner, anchor="nw")
+        src_inner.bind("<Configure>",
+            lambda e: src_canvas.configure(scrollregion=src_canvas.bbox("all")))
+        self._src_inner = src_inner
+        self._src_canvas = src_canvas
+
+        # Mouse-wheel scrolling on canvas and all its content
+        src_canvas.bind("<MouseWheel>", self._on_src_wheel)
+        src_inner.bind("<MouseWheel>", self._on_src_wheel)
+
+        # Right panel: field-source picker + preview
+        right = tk.Frame(paned, bg=BG2)
+        paned.add(right, weight=2)
+        self._build_field_picker(right)
+
+        # Force sash to saved/default position after window renders
+        default_sash = self._app._settings.get("meta_sash", 560)
+        paned.bind(
+            "<Map>",
+            lambda e, p=paned, d=default_sash: self.after(
+                50, lambda: self._apply_sash(p, d)))
+        paned.bind(
+            "<ButtonRelease-1>",
+            lambda e, p=paned: self._persist_sash(p))
+
+    def _apply_sash(self, paned: ttk.PanedWindow, pos: int) -> None:
+        try:
+            paned.update_idletasks()
+            if paned.winfo_width() > pos + 80:
+                paned.sashpos(0, pos)
+        except Exception:
+            pass
+
+    def _persist_sash(self, paned: ttk.PanedWindow) -> None:
+        try:
+            pos = paned.sashpos(0)
+            if pos > 0:
+                self._app._settings["meta_sash"] = pos
+                save_settings(self._app._settings)
+        except Exception:
+            pass
+
+    def _on_src_wheel(self, event) -> None:
+        self._src_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_wheel_to_tree(self, widget: tk.Widget) -> None:
+        """Recursively bind mouse-wheel on widget and all descendants."""
+        widget.bind("<MouseWheel>", self._on_src_wheel)
+        for child in widget.winfo_children():
+            self._bind_wheel_to_tree(child)
+
+    def _build_field_picker(self, parent: tk.Frame) -> None:
+        tk.Label(parent, bg=BG2, fg=FG, text="Field Sources",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+        tk.Label(parent, bg=BG2, fg=FG_DIM,
+                 text="Pick which source provides each field:",
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=10, pady=(0, 8))
+
+        grid_frame = tk.Frame(parent, bg=BG2)
+        grid_frame.pack(fill="x", padx=10)
+        self._field_combos: dict[str, ttk.Combobox] = {}
+
+        for row_idx, f in enumerate(self._FIELDS):
+            tk.Label(grid_frame, bg=BG2, fg=FG_DIM,
+                     text=self._FIELD_LABELS[f] + ":",
+                     font=("Segoe UI", 9), width=11, anchor="w"
+                     ).grid(row=row_idx, column=0, sticky="w", pady=3)
+            cb = ttk.Combobox(grid_frame, state="readonly", width=15)
+            cb.grid(row=row_idx, column=1, sticky="w", pady=3, padx=(4, 0))
+            cb.bind("<<ComboboxSelected>>",
+                    lambda e, field=f, combo=cb: self._on_combo_select(field, combo))
+            self._field_combos[f] = cb
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10, pady=10)
+
+        # Preview area
+        tk.Label(parent, bg=BG2, fg=FG, text="Preview",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(0, 6))
+        self._preview_cover = tk.Label(parent, bg=SEL,
+                                       text="No cover", fg=FG_DIM,
+                                       font=("Segoe UI", 8))
+        self._preview_cover.pack(fill="x", padx=10, pady=(0, 6))
+
+        self._preview_title = tk.Label(parent, bg=BG2, fg=ACCENT, text="",
+                                       font=("Segoe UI", 9, "bold"),
+                                       wraplength=280, justify="left", anchor="w")
+        self._preview_title.pack(anchor="w", padx=10)
+        self._preview_dev = tk.Label(parent, bg=BG2, fg=FG_DIM, text="",
+                                     font=("Segoe UI", 8), anchor="w")
+        self._preview_dev.pack(anchor="w", padx=10)
+        self._preview_syn = tk.Text(parent, bg=BG3, fg=FG,
+                                    height=6, wrap="word",
+                                    font=("Segoe UI", 8),
+                                    state="disabled", relief="flat")
+        self._preview_syn.pack(fill="x", padx=10, pady=(4, 0))
+
+    # ── Source column building ────────────────────────────────────────────────
+
+    def _build_source_column(self, source: str,
+                              candidates: list[MetadataCandidate]) -> None:
+        """Add or refresh a source column in the left pane."""
+        for child in self._src_inner.winfo_children():
+            if getattr(child, "_meta_source", None) == source:
+                child.destroy()
+
+        col = tk.Frame(self._src_inner, bg=BG,
+                       highlightbackground=FG_MUT, highlightthickness=1)
+        col._meta_source = source  # type: ignore[attr-defined]
+        col.pack(fill="x", padx=4, pady=4)
+
+        hdr = tk.Frame(col, bg=BG2, padx=8, pady=4)
+        hdr.pack(fill="x")
+        tk.Label(hdr, bg=BG2, fg=ACCENT,
+                 text=SOURCE_LABELS.get(source, source),
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+
+        if not candidates:
+            tk.Label(col, bg=BG, fg=FG_DIM, text="No results",
+                     font=("Segoe UI", 8), padx=8, pady=6).pack(anchor="w")
+            self._selected_candidate.setdefault(source, None)
+            self._refresh_field_combos()
+            return
+
+        self._selected_candidate[source] = candidates[0]
+        sel_var = tk.IntVar(value=0)
+
+        for i, cand in enumerate(candidates):
+            row = tk.Frame(col, bg=BG, padx=6, pady=4,
+                           highlightbackground=FG_MUT, highlightthickness=1,
+                           cursor="hand2")
+            row.pack(fill="x", padx=4, pady=2)
+
+            rb = tk.Radiobutton(
+                row, bg=BG, fg=FG, selectcolor=BG2,
+                variable=sel_var, value=i,
+                command=lambda c=cand, src=source: self._pick_candidate(src, c),
+            )
+            rb.pack(side="left")
+
+            info = tk.Frame(row, bg=BG)
+            info.pack(side="left", fill="x", expand=True)
+            tk.Label(info, bg=BG, fg=FG, text=cand.title,
+                     font=("Segoe UI", 8, "bold"),
+                     wraplength=340, justify="left", anchor="w").pack(anchor="w")
+            if cand.developer:
+                tk.Label(info, bg=BG, fg=FG_DIM, text=cand.developer,
+                         font=("Segoe UI", 7), anchor="w").pack(anchor="w")
+            if cand.synopsis:
+                snippet = cand.synopsis[:120] + ("…" if len(cand.synopsis) > 120 else "")
+                tk.Label(info, bg=BG, fg=FG_MUT, text=snippet,
+                         font=("Segoe UI", 7), wraplength=340,
+                         justify="left", anchor="w").pack(anchor="w")
+
+            if cand.cover_url and HAS_PIL and HAS_SCRAPING:
+                thumb_lbl = tk.Label(row, bg=BG, text="")
+                thumb_lbl.pack(side="right", padx=4)
+                threading.Thread(
+                    target=self._load_thumb,
+                    args=(cand.cover_url, thumb_lbl),
+                    daemon=True,
+                ).start()
+
+        self._refresh_field_combos()
+        self._bind_wheel_to_tree(col)
+        # Auto-assign fields from first source that loads with data
+        self._auto_assign(source, candidates[0])
+
+    def _load_thumb(self, url: str, label: tk.Label) -> None:
+        if not HAS_PIL or not HAS_SCRAPING:
+            return
+        try:
+            resp = _req.get(url, headers={"User-Agent": SCRAPER_UA},
+                            timeout=SCRAPER_TIMEOUT)
+            resp.raise_for_status()
+            from io import BytesIO
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            img.thumbnail((64, 48), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.after(0, lambda lbl=label, ph=photo: self._set_thumb(lbl, ph))
+        except Exception:
+            pass
+
+    def _set_thumb(self, lbl: tk.Label, photo: "ImageTk.PhotoImage") -> None:
+        if lbl.winfo_exists():
+            lbl.configure(image=photo, width=64, height=48)
+            lbl._photo = photo  # type: ignore[attr-defined]
+
+    # ── Candidate / field-source management ──────────────────────────────────
+
+    def _pick_candidate(self, source: str, cand: MetadataCandidate) -> None:
+        """User clicked a radio button to select this candidate."""
+        self._selected_candidate[source] = cand
+        provider = _PROVIDERS.get(source) if HAS_SCRAPING else None
+        # If this candidate is shallow (no developer/cover), enrich it lazily
+        if provider and hasattr(provider, "fetch_thread") and not cand.developer and not cand.cover_url:
+            threading.Thread(
+                target=self._enrich_candidate,
+                args=(source, cand),
+                daemon=True,
+            ).start()
+        else:
+            self._auto_assign(source, cand)
+            self._update_preview()
+
+    def _enrich_candidate(self, source: str, original: MetadataCandidate) -> None:
+        provider = _PROVIDERS.get(source)
+        if not provider:
+            return
+        try:
+            enriched = provider.fetch_thread(original.url)  # type: ignore[attr-defined]
+        except Exception:
+            return
+        # Only apply if the user hasn't switched to a different candidate
+        if self._selected_candidate.get(source) is original:
+            self.after(0, lambda e=enriched, s=source: self._on_enriched(s, e))
+
+    def _on_enriched(self, source: str, enriched: MetadataCandidate) -> None:
+        """Called on main thread after lazy enrichment completes."""
+        self._selected_candidate[source] = enriched
+        self._auto_assign(source, enriched)
+        self._update_preview()
+
+    def _auto_assign(self, source: str, cand: MetadataCandidate) -> None:
+        """Fill any unset fields from this candidate."""
+        for f in self._FIELDS:
+            if not self._field_source[f]:
+                val = self._candidate_value(cand, f)
+                if val:
+                    self._field_source[f] = source
+        self._sync_combos_to_state()
+        self._update_preview()
+
+    def _refresh_field_combos(self) -> None:
+        """Rebuild combo value lists from currently available sources."""
+        self._combo_keys = [s for s, c in self._selected_candidate.items()
+                            if c is not None]
+        display = ["(none)"] + [SOURCE_LABELS.get(k, k) for k in self._combo_keys]
+        for cb in self._field_combos.values():
+            cb["values"] = display
+        self._sync_combos_to_state()
+
+    def _sync_combos_to_state(self) -> None:
+        """Set each combo's displayed text to match _field_source[f] (a key)."""
+        for f, cb in self._field_combos.items():
+            key = self._field_source[f]
+            if key and key in self._combo_keys:
+                cb.set(SOURCE_LABELS.get(key, key))
+            else:
+                cb.set("(none)")
+
+    def _on_combo_select(self, field: str, combo: ttk.Combobox) -> None:
+        """User picked a source from a combo — store the key, update preview."""
+        idx = combo.current()
+        if idx <= 0:
+            self._field_source[field] = ""
+        else:
+            key = self._combo_keys[idx - 1]
+            self._field_source[field] = key
+        self._update_preview()
+
+    # ── Preview ───────────────────────────────────────────────────────────────
+
+    def _update_preview(self) -> None:
+        """Refresh the right-hand preview from current _field_source selections."""
+        title = dev = syn = ""
+        cover_url = ""
+
+        for f in self._FIELDS:
+            src = self._field_source[f]
+            cand = self._selected_candidate.get(src)
+            if not cand:
+                continue
+            if f == "title":
+                title = cand.title
+            elif f == "developer":
+                dev = cand.developer
+            elif f == "synopsis":
+                syn = cand.synopsis
+            elif f == "cover_art":
+                cover_url = cand.cover_url
+
+        self._preview_title.configure(text=title)
+        self._preview_dev.configure(text=dev)
+        self._preview_syn.configure(state="normal")
+        self._preview_syn.delete("1.0", "end")
+        if syn:
+            self._preview_syn.insert("1.0", syn)
+        self._preview_syn.configure(state="disabled")
+
+        if cover_url and cover_url != self._preview_url and HAS_PIL and HAS_SCRAPING:
+            self._preview_url = cover_url
+            threading.Thread(
+                target=self._fetch_preview_cover,
+                args=(cover_url,),
+                daemon=True,
+            ).start()
+        elif not cover_url:
+            self._preview_url = ""
+            self._preview_cover.configure(image="", text="No cover")
+
+    def _fetch_preview_cover(self, url: str) -> None:
+        try:
+            resp = _req.get(url, headers={"User-Agent": SCRAPER_UA},
+                            timeout=SCRAPER_TIMEOUT)
+            resp.raise_for_status()
+            from io import BytesIO
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            img.thumbnail((300, 180), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.after(0, lambda ph=photo, u=url: self._set_preview_cover(ph, u))
+        except Exception:
+            pass
+
+    def _set_preview_cover(self, photo: "ImageTk.PhotoImage", url: str) -> None:
+        # Discard if user already switched to a different source
+        if not self.winfo_exists() or url != self._preview_url:
+            return
+        self._preview_cover.configure(image=photo, text="")
+        self._preview_cover._photo = photo  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _candidate_value(cand: MetadataCandidate, field: str) -> str:
+        return {
+            "title":     cand.title,
+            "developer": cand.developer,
+            "synopsis":  cand.synopsis,
+            "cover_art": cand.cover_url,
+            "tags":      ", ".join(cand.tags),
+        }.get(field, "")
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def populate_source(self, source: str,
+                        candidates: list[MetadataCandidate] | Exception) -> None:
+        """Called from MetadataFetcher callback — safe to call from any thread."""
+        if isinstance(candidates, Exception):
+            self.after(0, lambda: self._build_error_column(source, str(candidates)))
+        else:
+            self.after(0, lambda c=candidates: self._build_source_column(source, c))
+
+    def _build_error_column(self, source: str, msg: str) -> None:
+        for child in self._src_inner.winfo_children():
+            if getattr(child, "_meta_source", None) == source:
+                child.destroy()
+
+        col = tk.Frame(self._src_inner, bg=BG,
+                       highlightbackground=RED, highlightthickness=1)
+        col._meta_source = source  # type: ignore[attr-defined]
+        col.pack(fill="x", padx=4, pady=4)
+        hdr = tk.Frame(col, bg=BG2, padx=8, pady=4)
+        hdr.pack(fill="x")
+        tk.Label(hdr, bg=BG2, fg=RED,
+                 text=SOURCE_LABELS.get(source, source) + " — Error",
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(col, bg=BG, fg=FG_DIM,
+                 text=msg[:160], font=("Segoe UI", 7),
+                 wraplength=400, padx=8, pady=4).pack(anchor="w")
+        self._selected_candidate[source] = None
+        self._refresh_field_combos()
+        self._bind_wheel_to_tree(col)
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+
+    def _save(self) -> None:
+        """Build metadata dict from selections and save to .vnpf/ synchronously."""
+        field_sources: dict[str, str] = {}
+        final: dict[str, object] = {}
+        cover_url = ""
+
+        for f in self._FIELDS:
+            src = self._field_source[f]
+            cand = self._selected_candidate.get(src)
+            if not cand:
+                continue
+            field_sources[f] = src
+            if f == "title":
+                final["game_title"] = cand.title
+            elif f == "developer":
+                final["developer"] = cand.developer
+            elif f == "synopsis":
+                final["synopsis"] = cand.synopsis
+            elif f == "cover_art":
+                cover_url = cand.cover_url
+            elif f == "tags":
+                final["fetched_tags"] = cand.tags
+
+        sources: dict[str, dict] = {}
+        for src, cand in self._selected_candidate.items():
+            if cand:
+                sources[src] = {
+                    "url":        cand.url,
+                    "fetched_at": datetime.datetime.now().date().isoformat(),
+                }
+
+        meta: dict = {
+            "vnpf_version": 1,
+            "fetched_at":   datetime.datetime.now().date().isoformat(),
+            "field_sources": field_sources,
+            "sources":       sources,
+            **final,
+        }
+
+        folder_path = self._version.folder_path
+
+        # Disable save button while working
+        self._save_btn.configure(text="Saving…", state="disabled")
+
+        def _bg_save():
+            if cover_url and HAS_SCRAPING:
+                _download_cover(cover_url, folder_path)
+            save_game_metadata(folder_path, meta)
+            self._version.metadata = meta
+            self._app.after(0, self._finish_save)
+
+        threading.Thread(target=_bg_save, daemon=True).start()
+
+    def _finish_save(self) -> None:
+        self._app.refresh()
+        if self.winfo_exists():
+            self.destroy()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1419,6 +2778,35 @@ class DetailPanel(ttk.Frame):
             style="Danger.TButton", command=self._delete_archive)
         self._btn_del_arc.pack(side="left", expand=True, fill="x")
 
+        # ── Metadata row ─────────────────────────────────────────────────────
+        ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=(8, 4))
+        meta_hdr = tk.Frame(inner, bg=BG)
+        meta_hdr.pack(fill="x")
+        tk.Label(meta_hdr, bg=BG, fg=FG_DIM, text="Metadata",
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+        self._btn_fetch_meta = ttk.Button(
+            meta_hdr, text="⬇ Fetch…", command=self._fetch_metadata)
+        self._btn_fetch_meta.pack(side="right")
+        if not HAS_SCRAPING:
+            self._btn_fetch_meta.configure(state="disabled")
+            tk.Label(meta_hdr, bg=BG, fg=FG_MUT,
+                     text="(pip install curl-cffi beautifulsoup4 lxml)",
+                     font=("Segoe UI", 7)).pack(side="right", padx=(0, 4))
+
+        self._meta_source_lbl = tk.Label(
+            inner, bg=BG, fg=FG_MUT, text="", font=("Segoe UI", 7), anchor="w")
+        self._meta_source_lbl.pack(fill="x")
+
+        # Synopsis expander
+        self._synopsis_frame = tk.Frame(inner, bg=BG)
+        self._synopsis_frame.pack(fill="x", pady=(2, 0))
+        self._synopsis_text = tk.Text(
+            self._synopsis_frame, height=4, bg=BG2, fg=FG,
+            insertbackground=FG, relief="flat", font=("Segoe UI", 8),
+            wrap="word", padx=4, pady=3, state="disabled")
+        self._synopsis_text.pack(fill="x")
+        self._synopsis_frame.pack_forget()   # hidden until metadata has synopsis
+
         self._set_enabled(False)
 
     @staticmethod
@@ -1456,6 +2844,7 @@ class DetailPanel(ttk.Frame):
         self._render_tags(ud.tags.get(g.base_key, []))
         self._load_notes(ud)
         self._load_art(g, ud, tc)
+        self._refresh_metadata_display()
 
     def show_empty(self) -> None:
         self._group = None
@@ -1483,12 +2872,18 @@ class DetailPanel(ttk.Frame):
         self._btn_played.configure(
             text="Mark Unplayed" if played else "Mark Played")
 
-        has_saves = bool(v.local_save_dir.exists() or
-                         (v.appdata_save_dir and v.appdata_save_dir.exists()))
-        self._btn_saves.configure(
-            state="normal" if has_saves else "disabled")
+        if v.is_renpy:
+            has_saves = bool(v.local_save_dir.exists() or
+                             (v.appdata_save_dir and v.appdata_save_dir.exists()))
+            self._btn_saves.configure(state="normal" if has_saves else "disabled")
+        else:
+            self._btn_saves.configure(state="disabled")
         self._btn_launch.configure(
             state="normal" if v.exe_path else "disabled")
+        # Show engine note in title for non-RenPy games
+        engine_note = "" if v.is_renpy else "  [Non-RenPy EXE]"
+        name = (self._group.display_name if self._group else "") + engine_note
+        self._title_lbl.configure(text=name)
         has_arc = bool(self._group and self._group.archives)
         self._btn_del_arc.configure(
             state="normal" if has_arc else "disabled")
@@ -1548,6 +2943,162 @@ class DetailPanel(ttk.Frame):
         for b in (self._btn_launch, self._btn_open, self._btn_played,
                   self._btn_saves, self._btn_hide, self._btn_del_arc):
             b.configure(state=s)
+        if HAS_SCRAPING:
+            self._btn_fetch_meta.configure(state=s)
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+
+    def _refresh_metadata_display(self) -> None:
+        """Show synopsis and source line if metadata present for this version."""
+        v = self._version
+        if not v or not v.metadata:
+            self._meta_source_lbl.configure(text="")
+            self._synopsis_frame.pack_forget()
+            return
+
+        meta = v.metadata
+        sources = meta.get("sources", {})
+        src_names = [SOURCE_LABELS.get(s, s) for s in sources]
+        self._meta_source_lbl.configure(
+            text="Sources: " + ", ".join(src_names) if src_names else "")
+
+        synopsis = meta.get("synopsis", "")
+        if synopsis:
+            self._synopsis_text.configure(state="normal")
+            self._synopsis_text.delete("1.0", "end")
+            self._synopsis_text.insert("1.0", synopsis)
+            self._synopsis_text.configure(state="disabled")
+            self._synopsis_frame.pack(fill="x", pady=(2, 0))
+        else:
+            self._synopsis_frame.pack_forget()
+
+    def _fetch_metadata(self) -> None:
+        v = self._version
+        if not v:
+            return
+        if not self._app.net_ok("fetch_metadata"):
+            messagebox.showinfo(
+                "Disabled",
+                "Metadata fetch is disabled.\n\n"
+                "Enable it in Settings → Connection.",
+                parent=self)
+            return
+        if not HAS_SCRAPING:
+            messagebox.showinfo(
+                "Scraping Unavailable",
+                "curl_cffi and beautifulsoup4 are not installed.\n\n"
+                "Run:  pip install curl-cffi beautifulsoup4 lxml",
+                parent=self,
+            )
+            return
+
+        # ── Search query editor ──────────────────────────────────────────────
+        root = self._app
+        dlg = tk.Toplevel(root)
+        dlg.title("Fetch Metadata")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(root)
+
+        pad = {"padx": 16}
+
+        tk.Label(dlg, bg=BG, fg=FG_DIM,
+                 text="Search query  (edit if the title looks wrong):",
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(12, 0))
+
+        # Use the stored title but clean any leftover [bracket] conventions
+        # (old saves may contain raw F95Zone thread-title format)
+        _stored = v.metadata.get("game_title", "")
+        default_title = (
+            re.sub(r"\s*\[[^\]]+\]", "", _stored).strip()
+            if _stored else v.display_name
+        )
+        query_var = tk.StringVar(value=default_title)
+        entry = ttk.Entry(dlg, textvariable=query_var, width=44)
+        entry.pack(anchor="w", padx=16, pady=(4, 0))
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        tk.Label(dlg, bg=BG, fg=FG_DIM, text="Sources:",
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(10, 2))
+
+        src_vars = {
+            "vndb":       tk.BooleanVar(value=True),
+            "itchio":     tk.BooleanVar(value=True),
+            "f95zone":    tk.BooleanVar(value=bool(load_site_cookies("f95zone"))),
+            "lewdcorner": tk.BooleanVar(value=bool(load_site_cookies("lewdcorner"))),
+        }
+        for src, var in src_vars.items():
+            label = SOURCE_LABELS.get(src, src)
+            if src == "vndb":
+                suffix = ""
+            elif src == "itchio":
+                suffix = "  ✓" if load_site_cookies(src) else "  (log in for adult content)"
+            else:
+                suffix = "  ✓" if load_site_cookies(src) else "  (not logged in)"
+            tk.Checkbutton(dlg, bg=BG, fg=FG, selectcolor=BG2,
+                           activebackground=BG, activeforeground=FG,
+                           text=label + suffix, variable=var).pack(
+                               anchor="w", padx=24)
+
+        login_lbl = tk.Label(dlg, bg=BG, fg=ACCENT, cursor="hand2",
+                             text="Manage site logins →",
+                             font=("Segoe UI", 8, "underline"))
+        login_lbl.pack(anchor="w", padx=16, pady=(6, 0))
+        login_lbl.bind("<Button-1>", lambda _: (dlg.destroy(),
+                                                 root.open_cookie_settings()))
+
+        btn_row = tk.Frame(dlg, bg=BG)
+        btn_row.pack(fill="x", padx=16, pady=12)
+        search_clicked = [False]
+
+        def _do_search():
+            search_clicked[0] = True
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Search", style="Accent.TButton",
+                   command=_do_search).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="Cancel",
+                   command=dlg.destroy).pack(side="left")
+
+        dlg.bind("<Return>", lambda _: _do_search())
+        dlg.update_idletasks()
+        px = root.winfo_rootx() + root.winfo_width()  // 2 - dlg.winfo_width()  // 2
+        py = root.winfo_rooty() + root.winfo_height() // 2 - dlg.winfo_height() // 2
+        dlg.geometry(f"+{max(0,px)}+{max(0,py)}")
+        dlg.grab_set()
+        dlg.wait_window()
+
+        if not search_clicked[0]:
+            return
+
+        search_title = query_var.get().strip() or default_title
+        sources = [s for s, var in src_vars.items() if var.get()]
+        if not sources:
+            return
+
+        # ── Fire the fetcher ──────────────────────────────────────────────────
+        picker   = MetadataPickerDialog(self.winfo_toplevel(), v, self._app)
+        progress = FetchProgressDialog(self.winfo_toplevel(), search_title, sources)
+
+        def on_result(source: str,
+                      result: "list[MetadataCandidate] | Exception") -> None:
+            if progress.winfo_exists():
+                if isinstance(result, Exception):
+                    msg = str(result)[:60]
+                    progress.after(0, lambda s=source, m=msg: progress.set_status(
+                        s, f"Error: {m}", RED))
+                else:
+                    n = len(result)
+                    progress.after(0, lambda s=source, n=n: progress.set_status(
+                        s, f"{n} result{'s' if n != 1 else ''}", GREEN))
+            picker.populate_source(source, result)
+
+        def on_done() -> None:
+            if progress.winfo_exists():
+                progress.after(0, progress.destroy)
+
+        MetadataFetcher(search_title, sources, on_result, on_done).start()
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
@@ -1560,6 +3111,7 @@ class DetailPanel(ttk.Frame):
                 self._version = v
                 break
         self._refresh_stats(self._app.user_data)
+        self._refresh_metadata_display()
 
     def _launch(self) -> None:
         v = self._version
@@ -2135,7 +3687,17 @@ class ExtractionQueueWindow(tk.Toplevel):
 
 # Root-level items that are always safe to keep
 SAFE_ROOT_NAMES = {
-    "renpy_manager.py", "renpy_manager.json", ".manager_cache",
+    # app own subfolder (all app files live here now)
+    "_VNPathfinder",
+    # legacy app files at games root (pre-reorganisation)
+    "vn_pathfinder.py", "vn_pathfinder.json",
+    "renpy_manager.py", "renpy_manager.json",
+    "vn_pathfinder.spec",
+    "requirements.txt", "build.bat",
+    "installer.iss", "LICENSE", "README.md",
+    "assets", "build", "dist", "docs",
+    "__pycache__", ".github", ".git",
+    # common RenPy root clutter
     "lib", "win", "renpy",
     "orpheus_voice.rpy", "orpheus_voice_guide.html",
 }
@@ -3007,6 +4569,610 @@ class ArchivesTab(ttk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SITE LOGIN  (form-based, no browser dependency)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _form_login(site_key: str, username: str, password: str) -> str:
+    """
+    Log in to a site using curl_cffi form POST.
+    Returns "" on success, or an error message string on failure.
+    Saves cookies to disk on success.
+    """
+    if not HAS_SCRAPING:
+        return "curl_cffi not installed."
+
+    def _resp_cookies(resp) -> dict:
+        """Extract cookies from a response object — works around curl_cffi
+        Session jar inconsistencies by reading the raw response cookies."""
+        try:
+            return dict(resp.cookies)
+        except Exception:
+            return {}
+
+    def _merge(*cookie_dicts) -> dict:
+        out: dict = {}
+        for d in cookie_dicts:
+            out.update(d)
+        return out
+
+    try:
+        session = _req.Session(impersonate="chrome131")
+
+        if site_key == "itchio":
+            login_url = f"{ITCHIO_BASE}/login"
+            # Warmup: hit the homepage first so Cloudflare issues cf_clearance
+            # before we touch the login page (itch.io CF is stricter than others)
+            session.get(ITCHIO_BASE, timeout=SCRAPER_TIMEOUT)
+            # Step 1: GET login page — session now carries cf_clearance
+            r_get = session.get(login_url, timeout=SCRAPER_TIMEOUT)
+            get_cookies = _merge(dict(session.cookies), _resp_cookies(r_get))
+
+            # CSRF token = the itchio_token cookie set by the GET response
+            csrf = (get_cookies.get("itchio_token", "")
+                    or get_cookies.get("csrf_token", ""))
+            # Also check HTML form / meta / inline JS as fallbacks
+            if not csrf:
+                soup = _BS(r_get.text, "lxml")
+                el = soup.select_one('input[name="csrf_token"]')
+                if el:
+                    csrf = el.get("value", "")
+            if not csrf:
+                m = re.search(r'"csrf_token"\s*[=:]\s*"([^"]{8,})"', r_get.text)
+                if m:
+                    csrf = m.group(1)
+
+            # tz = local timezone offset in minutes (matches what the browser sends)
+            import time as _time
+            tz_minutes = -int(_time.timezone / 60)
+
+            # Step 2: POST with all GET-phase cookies so cf_clearance is sent
+            r_post = session.post(
+                login_url, timeout=SCRAPER_TIMEOUT,
+                cookies=get_cookies,
+                headers={"Referer": login_url},
+                data={
+                    "username":   username,
+                    "password":   password,
+                    "csrf_token": csrf,
+                    "tz":         str(tz_minutes),
+                    "source":     "login_page",
+                })
+            post_cookies = _resp_cookies(r_post)
+            all_cookies  = _merge(get_cookies, post_cookies, dict(session.cookies))
+
+            # Success = redirected away from /login (302 → /my-feed)
+            final_url = getattr(r_post, "url", "")
+            if final_url.rstrip("/").endswith("/login"):
+                err_el = _BS(r_post.text, "lxml").select_one(
+                    ".form_errors li, .error_list li, p.error, .notice--error")
+                if err_el:
+                    return f"Login failed — {err_el.get_text(strip=True)}"
+                return (f"Login failed (csrf={'yes' if csrf else 'no'}; "
+                        f"cookies: {list(all_cookies.keys()) or 'none'}; "
+                        f"url: {final_url[:80]})")
+            save_site_cookies(site_key, all_cookies)
+            return ""
+
+        elif site_key == "f95zone":
+            r_get = session.get(f"{F95_BASE}/login", timeout=SCRAPER_TIMEOUT)
+            get_cookies = _merge(dict(session.cookies), _resp_cookies(r_get))
+            soup = _BS(r_get.text, "lxml")
+            tok_el = soup.select_one('input[name="_xfToken"]')
+            xf_token = tok_el.get("value", "") if tok_el else ""
+            r_post = session.post(
+                f"{F95_BASE}/login/login", timeout=SCRAPER_TIMEOUT,
+                cookies=get_cookies,
+                data={
+                    "login":    username,
+                    "password": password,
+                    "_xfToken": xf_token,
+                    "remember": "1",
+                })
+            post_cookies = _resp_cookies(r_post)
+            all_cookies  = _merge(get_cookies, post_cookies, dict(session.cookies))
+            if "xf_user" not in all_cookies:
+                return "Login failed — check your username and password."
+            save_site_cookies(site_key, all_cookies)
+            return ""
+
+        elif site_key == "lewdcorner":
+            # LewdCorner runs XenForo — identical flow to F95Zone
+            r_get = session.get(f"{LC_BASE}/login", timeout=SCRAPER_TIMEOUT)
+            get_cookies = _merge(dict(session.cookies), _resp_cookies(r_get))
+            soup = _BS(r_get.text, "lxml")
+            tok_el = soup.select_one('input[name="_xfToken"]')
+            xf_token = tok_el.get("value", "") if tok_el else ""
+            r_post = session.post(
+                f"{LC_BASE}/login/login", timeout=SCRAPER_TIMEOUT,
+                cookies=get_cookies,
+                headers={"Referer": f"{LC_BASE}/"},
+                data={
+                    "login":       username,
+                    "password":    password,
+                    "_xfToken":    xf_token,
+                    "remember":    "1",
+                    "_xfRedirect": f"{LC_BASE}/",
+                })
+            post_cookies = _resp_cookies(r_post)
+            all_cookies  = _merge(get_cookies, post_cookies, dict(session.cookies))
+            if "xf_user" not in all_cookies:
+                return "Login failed — check your username and password."
+            save_site_cookies(site_key, all_cookies)
+            return ""
+
+        else:
+            return f"Unknown site: {site_key}"
+
+    except Exception as exc:
+        return str(exc)
+
+
+# ── pywebview subprocess worker ─────────────────────────────────────────────
+# Must be a module-level function so multiprocessing can pickle it on Windows.
+
+def _webview_worker(url: str, success_url_fragment: str,
+                    out_queue: multiprocessing.Queue) -> None:
+    """
+    Run in a subprocess: open an embedded Chromium window at *url*.
+    Once the current URL contains *success_url_fragment*, scrape cookies
+    and put ("ok", {name: value, ...}) on the queue.
+    Cancelled / closed → ("cancel", {}).
+    Error → ("error", message).
+    """
+    try:
+        import webview
+        import threading as _thr
+
+        found: dict = {}
+        win = webview.create_window(
+            "Log in",
+            url,
+            width=980,
+            height=720,
+            on_top=True,
+        )
+
+        def _poll_loop() -> None:
+            import time as _t
+            while True:
+                _t.sleep(0.5)
+                try:
+                    cur = win.get_current_url() or ""
+                    if success_url_fragment in cur:
+                        # get_cookies() returns a list of SimpleCookie objects
+                        # (one SimpleCookie per cookie).  Iterate .items() to get
+                        # (name, Morsel) pairs; Morsel.value is the cookie value.
+                        for simple_cookie in (win.get_cookies() or []):
+                            try:
+                                for name, morsel in simple_cookie.items():
+                                    if name:
+                                        found[name] = morsel.value
+                            except Exception:
+                                # Fallback: treat as plain dict / object
+                                try:
+                                    n = getattr(simple_cookie, "name",  None) or simple_cookie.get("name",  "")
+                                    v = getattr(simple_cookie, "value", None) or simple_cookie.get("value", "")
+                                    if n:
+                                        found[n] = v
+                                except Exception:
+                                    pass
+                        out_queue.put(("ok", found))
+                        win.destroy()
+                        return
+                except Exception:
+                    pass  # window not ready yet — keep polling
+
+        def _on_shown() -> None:
+            _thr.Thread(target=_poll_loop, daemon=True).start()
+
+        win.events.shown += _on_shown
+        webview.start(gui="edgechromium", debug=False)
+
+        # If we reach here without found being populated the user closed the window
+        if not found:
+            out_queue.put(("cancel", {}))
+
+    except Exception as exc:
+        out_queue.put(("error", str(exc)))
+
+
+class SiteCookiesDialog(tk.Toplevel):
+    """
+    Login dialog for metadata scraping sites.
+    - itch.io  → embedded Chromium browser via pywebview (handles Cloudflare)
+    - F95Zone  → username + password form
+    - LewdCorner → username + password form
+    """
+
+    # (site_key, display_label, login_mode)
+    # login_mode: "browser" | "form"
+    _SITES = [
+        ("itchio",     "itch.io",     "browser"),
+        ("f95zone",    "F95Zone",     "form"),
+        ("lewdcorner", "Lewd Corner", "form"),
+    ]
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.title("Site Login")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+
+        # Keep a reference so the GC doesn't collect it mid-poll
+        self._webview_proc: multiprocessing.Process | None = None
+        self._webview_queue: multiprocessing.Queue | None = None
+
+        tk.Label(self, bg=BG, fg=FG,
+                 text="Log in to enable metadata scraping.",
+                 font=("Segoe UI", 10, "bold")).pack(padx=20, pady=(16, 4))
+        tk.Label(self, bg=BG, fg=FG_DIM,
+                 text="Credentials are used once to get a session token.\n"
+                      "Your password is never stored.",
+                 font=("Segoe UI", 9), justify="center").pack(padx=20, pady=(0, 10))
+
+        for site_key, label, login_mode in self._SITES:
+            has_cookies = bool(load_site_cookies(site_key))
+
+            frm = tk.LabelFrame(self, text=label, bg=BG, fg=ACCENT,
+                                font=("Segoe UI", 9, "bold"), padx=14, pady=10)
+            frm.pack(fill="x", padx=16, pady=(0, 8))
+
+            status_lbl = tk.Label(frm, bg=BG, font=("Segoe UI", 8),
+                                  text="✓ Logged in" if has_cookies else "Not logged in",
+                                  fg=GREEN if has_cookies else FG_DIM)
+            status_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+            if login_mode == "browser":
+                self._build_browser_section(frm, site_key, status_lbl)
+            else:
+                self._build_form_section(frm, site_key, status_lbl)
+
+        ttk.Button(self, text="Close", command=self.destroy).pack(pady=14)
+
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width()  // 2 - self.winfo_width()  // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2 - self.winfo_height() // 2
+        self.geometry(f"+{max(0,px)}+{max(0,py)}")
+
+    # ── section builders ────────────────────────────────────────────────────
+
+    def _build_browser_section(self, frm: tk.LabelFrame,
+                               site_key: str, status_lbl: tk.Label) -> None:
+        """itch.io: single button that opens an embedded browser window."""
+        inner = tk.Frame(frm, bg=BG)
+        inner.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        login_btn = ttk.Button(
+            inner, text="Log in with browser", style="Accent.TButton",
+            command=lambda: self._browser_login(site_key, status_lbl, login_btn)
+        )
+        login_btn.pack(side="left", padx=(0, 8))
+
+        if not HAS_WEBVIEW:
+            login_btn.configure(state="disabled")
+            tk.Label(inner, bg=BG, fg=YELLOW,
+                     text="pywebview not installed — run: pip install pywebview",
+                     font=("Segoe UI", 8)).pack(side="left")
+
+        ttk.Button(
+            inner, text="Log out",
+            command=lambda k=site_key, sl=status_lbl: self._logout(k, sl)
+        ).pack(side="left")
+
+    def _build_form_section(self, frm: tk.LabelFrame,
+                            site_key: str, status_lbl: tk.Label) -> None:
+        """F95Zone / LewdCorner: username + password entry fields."""
+        tk.Label(frm, bg=BG, fg=FG_DIM, text="Username:",
+                 font=("Segoe UI", 9), width=10, anchor="w").grid(
+                     row=1, column=0, sticky="w")
+        user_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=user_var, width=26).grid(
+            row=1, column=1, sticky="w", padx=(4, 8))
+
+        tk.Label(frm, bg=BG, fg=FG_DIM, text="Password:",
+                 font=("Segoe UI", 9), width=10, anchor="w").grid(
+                     row=2, column=0, sticky="w", pady=(4, 0))
+        pass_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=pass_var, show="●", width=26).grid(
+            row=2, column=1, sticky="w", padx=(4, 8), pady=(4, 0))
+
+        btn_frame = tk.Frame(frm, bg=BG)
+        btn_frame.grid(row=1, column=2, rowspan=2, sticky="e")
+
+        ttk.Button(
+            btn_frame, text="Log in",
+            style="Accent.TButton",
+            command=lambda k=site_key, u=user_var, p=pass_var,
+                           sl=status_lbl: self._login(k, u, p, sl)
+        ).pack(pady=(0, 4))
+        ttk.Button(
+            btn_frame, text="Log out",
+            command=lambda k=site_key, sl=status_lbl: self._logout(k, sl)
+        ).pack()
+
+    # ── browser login (itch.io) ─────────────────────────────────────────────
+
+    def _browser_login(self, site_key: str, status_lbl: tk.Label,
+                       login_btn: ttk.Button) -> None:
+        """Spawn a pywebview subprocess and poll for the success cookie."""
+        if not HAS_WEBVIEW:
+            return
+
+        login_btn.configure(state="disabled")
+        status_lbl.configure(text="Browser opening…", fg=YELLOW)
+        self.update()
+
+        q: multiprocessing.Queue = multiprocessing.Queue()
+        p = multiprocessing.Process(
+            target=_webview_worker,
+            args=(f"{ITCHIO_BASE}/login", "/my-feed", q),
+            daemon=True,
+        )
+        p.start()
+
+        self._webview_proc  = p
+        self._webview_queue = q
+
+        self._poll_webview(site_key, status_lbl, login_btn, q, p)
+
+    def _poll_webview(self, site_key: str, status_lbl: tk.Label,
+                      login_btn: ttk.Button,
+                      q: multiprocessing.Queue,
+                      p: multiprocessing.Process) -> None:
+        """Called every 500 ms from the tkinter event loop to check queue."""
+        # Dialog may have been closed by the user while the browser was open
+        if not self.winfo_exists():
+            if p.is_alive():
+                p.terminate()
+            return
+
+        try:
+            kind, payload = q.get_nowait()
+        except Exception:
+            # Nothing yet — is the process still alive?
+            if p.is_alive():
+                self.after(500, lambda: self._poll_webview(
+                    site_key, status_lbl, login_btn, q, p))
+            else:
+                # Process died unexpectedly
+                status_lbl.configure(text="✗ Browser closed unexpectedly", fg=RED)
+                login_btn.configure(state="normal")
+            return
+
+        p.join(timeout=2)
+
+        if kind == "ok":
+            cookies: dict = payload
+            if cookies:
+                save_site_cookies(site_key, cookies)
+                status_lbl.configure(text="✓ Logged in", fg=GREEN)
+            else:
+                status_lbl.configure(text="✗ No cookies captured — try again", fg=RED)
+        elif kind == "cancel":
+            status_lbl.configure(text="Login cancelled", fg=FG_DIM)
+        else:
+            status_lbl.configure(text=f"✗ {payload}", fg=RED)
+
+        login_btn.configure(state="normal")
+
+    # ── form login (F95 / LC) ───────────────────────────────────────────────
+
+    def _login(self, site_key: str, user_var: tk.StringVar,
+               pass_var: tk.StringVar, status_lbl: tk.Label) -> None:
+        u = user_var.get().strip()
+        p = pass_var.get()
+        if not u or not p:
+            messagebox.showwarning("Missing fields",
+                                   "Enter both username and password.",
+                                   parent=self)
+            return
+        status_lbl.configure(text="Logging in…", fg=YELLOW)
+        self.update()
+
+        def _bg():
+            err = _form_login(site_key, u, p)
+            if err:
+                status_lbl.after(0, lambda: status_lbl.configure(
+                    text=f"✗ {err}", fg=RED))
+            else:
+                pass_var.set("")   # clear password from UI
+                status_lbl.after(0, lambda: status_lbl.configure(
+                    text="✓ Logged in", fg=GREEN))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _logout(self, site_key: str, status_lbl: tk.Label) -> None:
+        save_site_cookies(site_key, {})
+        status_lbl.configure(text="Not logged in", fg=FG_DIM)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETTINGS DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SettingsDialog(tk.Toplevel):
+    """App-wide settings window."""
+
+    def __init__(self, app: "LibraryApp") -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Settings")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(app)
+        self.grab_set()
+        self._build()
+        self.update_idletasks()
+        x = app.winfo_x() + (app.winfo_width()  - self.winfo_width())  // 2
+        y = app.winfo_y() + (app.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        s = self.app._settings
+
+        # ── General section ───────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=BG2)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="  General", bg=BG2, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold"), pady=6).pack(side="left")
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=20, pady=(10, 4))
+        tk.Label(row, text="Game library directory", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+
+        dir_row = tk.Frame(self, bg=BG)
+        dir_row.pack(fill="x", padx=20, pady=(0, 10))
+        self._lib_var = tk.StringVar(value=s.get("library_dir", str(RENPY_DIR)))
+        ttk.Entry(dir_row, textvariable=self._lib_var, width=46).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(dir_row, text="Browse…",
+                   command=self._browse_lib).pack(side="left", padx=(4, 0))
+        ttk.Button(dir_row, text="Apply",
+                   command=self._apply_lib_dir).pack(side="left", padx=(4, 0))
+
+        # ── Connection section ────────────────────────────────────────────────
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=(4, 0))
+        hdr2 = tk.Frame(self, bg=BG2)
+        hdr2.pack(fill="x")
+        tk.Label(hdr2, text="  Connection", bg=BG2, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold"), pady=6).pack(side="left")
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+
+        # LOCKDOWN master toggle
+        lock_row = tk.Frame(self, bg=BG)
+        lock_row.pack(fill="x", padx=20, pady=(10, 2))
+        self._lock_var = tk.BooleanVar(value=bool(s.get("lockdown", True)))
+        self._lock_cb = tk.Checkbutton(
+            lock_row,
+            text="  LOCKDOWN MODE  —  block all internet access",
+            variable=self._lock_var,
+            bg=BG, fg=RED,
+            selectcolor=BG3,
+            activebackground=BG, activeforeground=RED,
+            font=("Segoe UI", 10, "bold"),
+            command=self._on_lockdown_toggle)
+        self._lock_cb.pack(side="left")
+
+        lock_note = tk.Label(
+            self,
+            text="Master override — blocks all connectivity regardless of individual\n"
+                 "settings. ON by default. Only this toggle can restore access.",
+            bg=BG, fg=FG_DIM, font=("Segoe UI", 8), justify="left")
+        lock_note.pack(anchor="w", padx=36, pady=(0, 8))
+
+        ttk.Separator(self, orient="horizontal").pack(
+            fill="x", padx=20, pady=(0, 6))
+
+        # Individual net toggles — each in its own row for optional extra widgets
+        self._net_toggles: list[tuple[str, tk.BooleanVar, tk.Checkbutton]] = []
+        # (key, label, extra_widget_builder_or_None)
+        toggle_defs = [
+            ("check_updates",        "App update checks"),
+            ("fetch_metadata",       "Metadata fetch  (VNDB, F95Zone, LewdCorner)"),
+            ("allow_provider_login", "Provider logins  (site cookies / webview)"),
+        ]
+        tgl_frame = tk.Frame(self, bg=BG)
+        tgl_frame.pack(fill="x", padx=36, pady=(0, 14))
+        self._check_now_btn: ttk.Button | None = None
+        for key, label in toggle_defs:
+            default = bool(_SETTINGS_DEFAULTS.get(key, True))
+            var = tk.BooleanVar(value=bool(s.get(key, default)))
+            row = tk.Frame(tgl_frame, bg=BG)
+            row.pack(fill="x", pady=2)
+            cb = tk.Checkbutton(
+                row, text=label,
+                variable=var,
+                bg=BG, fg=FG,
+                selectcolor=BG3,
+                activebackground=BG, activeforeground=FG,
+                font=("Segoe UI", 9),
+                command=lambda k=key, v=var: self._on_net_toggle(k, v))
+            cb.pack(side="left")
+            if key == "check_updates":
+                self._check_now_btn = ttk.Button(
+                    row, text="Check Now", command=self._check_now)
+                self._check_now_btn.pack(side="left", padx=(10, 0))
+            self._net_toggles.append((key, var, cb))
+
+        self._sync_lockdown_ui()
+
+        # ── Close + version footer ─────────────────────────────────────────────
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+        foot = tk.Frame(self, bg=BG)
+        foot.pack(fill="x", padx=16, pady=(6, 0))
+        tk.Label(foot, text=f"VN Pathfinder  v{APP_VERSION}",
+                 bg=BG, fg=FG_MUT, font=("Segoe UI", 8)).pack(side="right")
+        ttk.Button(self, text="Close",
+                   command=self.destroy).pack(pady=(4, 10))
+
+    # ── General handlers ──────────────────────────────────────────────────────
+
+    def _browse_lib(self) -> None:
+        d = filedialog.askdirectory(
+            title="Select game library directory",
+            initialdir=self._lib_var.get() or str(RENPY_DIR),
+            parent=self)
+        if d:
+            self._lib_var.set(d)
+
+    def _apply_lib_dir(self) -> None:
+        p_str = self._lib_var.get().strip()
+        if not p_str:
+            return
+        p = Path(p_str)
+        if not p.is_dir():
+            messagebox.showerror("Invalid path",
+                                 f"Directory not found:\n{p_str}", parent=self)
+            return
+        self.app._settings["library_dir"] = str(p)
+        save_settings(self.app._settings)
+        _set_lib_dir(p)
+        self.app.refresh()
+
+    # ── Connection handlers ───────────────────────────────────────────────────
+
+    def _on_lockdown_toggle(self) -> None:
+        locked = self._lock_var.get()
+        self.app._settings["lockdown"] = locked
+        if locked:
+            for key, var, _ in self._net_toggles:
+                var.set(False)
+                self.app._settings[key] = False
+            self.app._upd_note_lbl.configure(text="")
+        save_settings(self.app._settings)
+        self._sync_lockdown_ui()
+        self.app._update_lockdown_indicator()
+
+    def _on_net_toggle(self, key: str, var: tk.BooleanVar) -> None:
+        self.app._settings[key] = var.get()
+        save_settings(self.app._settings)
+
+    def _check_now(self) -> None:
+        if not self.app.net_ok("check_updates"):
+            messagebox.showinfo(
+                "Blocked by Lockdown",
+                "Update checks are blocked while Lockdown Mode is active.\n\n"
+                "Disable Lockdown Mode in Settings → Connection first.",
+                parent=self)
+            return
+        self.app._upd_note_lbl.configure(text="Checking…", fg=FG_DIM)
+        self.app._start_update_check()
+
+    def _sync_lockdown_ui(self) -> None:
+        locked = self._lock_var.get()
+        state = "disabled" if locked else "normal"
+        for _, _, cb in self._net_toggles:
+            cb.configure(state=state, fg=FG_MUT if locked else FG)
+        if self._check_now_btn is not None:
+            self._check_now_btn.configure(state=state)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3028,6 +5194,12 @@ class LibraryApp(tk.Tk):
                 pass
 
         self._settings: dict = load_settings()
+        # Apply saved library directory (overrides APP_DIR.parent default)
+        _lib = self._settings.get("library_dir", "")
+        if _lib:
+            _p = Path(_lib)
+            if _p.is_dir():
+                _set_lib_dir(_p)
         self.user_data: UserData = load_userdata()
         self.groups: list[GameGroup] = []
         self.thumb_cache: ThumbnailCache = ThumbnailCache(self)
@@ -3038,9 +5210,10 @@ class LibraryApp(tk.Tk):
         self._queue_window: ExtractionQueueWindow | None = None
 
         self._build_ui()
+        self._update_lockdown_indicator()
         self.refresh()
         # Kick off update check 800 ms after window opens
-        if self._settings.get("check_updates", True):
+        if self.net_ok("check_updates"):
             self.after(800, self._start_update_check)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -3049,10 +5222,12 @@ class LibraryApp(tk.Tk):
         # ── Top toolbar ──────────────────────────────────────────────────────
         tb = ttk.Frame(self, padding=(12, 8))
         tb.pack(fill="x")
-        ttk.Label(tb, text="RenPy Library",
+        ttk.Label(tb, text="VN Pathfinder",
                   font=("Segoe UI", 15, "bold"),
                   foreground=ACCENT).pack(side="left")
 
+        ttk.Button(tb, text="⚙ Settings",
+                   command=self.open_settings).pack(side="right", padx=4)
         ttk.Button(tb, text="⟳ Refresh",
                    command=self.refresh).pack(side="right", padx=4)
         self._btn_hidden = ttk.Button(
@@ -3116,19 +5291,29 @@ class LibraryApp(tk.Tk):
         ttk.Separator(self._lib_frame, orient="horizontal").pack(fill="x")
 
         # Horizontal pane: card list | detail panel
-        pane = ttk.PanedWindow(self._lib_frame, orient="horizontal")
-        pane.pack(fill="both", expand=True)
+        self._lib_pane = ttk.PanedWindow(self._lib_frame, orient="horizontal")
+        self._lib_pane.pack(fill="both", expand=True)
 
-        left = ttk.Frame(pane)
-        pane.add(left, weight=2)
+        left = ttk.Frame(self._lib_pane)
+        self._lib_pane.add(left, weight=2)
         self.card_list = ScrollableCardList(
             left, on_select_cb=self.select_group)
         self.card_list.pack(fill="both", expand=True)
 
-        right = ttk.Frame(pane)
-        pane.add(right, weight=1)
+        right = ttk.Frame(self._lib_pane)
+        self._lib_pane.add(right, weight=1)
         self.detail_panel = DetailPanel(right, app=self)
         self.detail_panel.pack(fill="both", expand=True)
+
+        # Restore saved sash position after window is drawn
+        default_sash = self._settings.get("lib_sash", 620)
+        self._lib_pane.bind(
+            "<Map>",
+            lambda e, p=self._lib_pane, d=default_sash: self.after(
+                50, lambda: self._apply_lib_sash(p, d)))
+        self._lib_pane.bind(
+            "<ButtonRelease-1>",
+            lambda e, p=self._lib_pane: self._persist_lib_sash(p))
 
         # Archives tab
         self._arc_frame = ttk.Frame(self.notebook)
@@ -3142,20 +5327,36 @@ class LibraryApp(tk.Tk):
         sb.pack(fill="x")
         self._status_lbl = ttk.Label(sb, style="Status.TLabel", text="")
         self._status_lbl.pack(side="left", fill="x", expand=True)
-        # Update checker controls (right side of status bar)
+        # Lockdown indicator (far right)
+        self._lockdown_lbl = tk.Label(
+            sb, text="", bg=BG2, fg=RED,
+            font=("Segoe UI", 8, "bold"), cursor="hand2")
+        self._lockdown_lbl.pack(side="right", padx=(0, 10))
+        self._lockdown_lbl.bind("<Button-1>", lambda _: self.open_settings())
+        # Update notification label
         self._upd_note_lbl = tk.Label(
             sb, text="", bg=BG2, fg=ACCENT,
             font=("Segoe UI", 8), cursor="hand2")
-        self._upd_note_lbl.pack(side="right", padx=(0, 4))
-        self._upd_var = tk.BooleanVar(
-            value=self._settings.get("check_updates", True))
-        tk.Checkbutton(
-            sb, text="Check for updates",
-            variable=self._upd_var, bg=BG2, fg=FG_DIM,
-            selectcolor=SEL, activebackground=BG2, activeforeground=FG,
-            font=("Segoe UI", 8),
-            command=self._on_update_toggle
-        ).pack(side="right", padx=(0, 8))
+        self._upd_note_lbl.pack(side="right", padx=(0, 8))
+
+    # ── Sash persistence ─────────────────────────────────────────────────────
+
+    def _apply_lib_sash(self, pane: ttk.PanedWindow, pos: int) -> None:
+        try:
+            pane.update_idletasks()
+            if pane.winfo_width() > pos + 100:
+                pane.sashpos(0, pos)
+        except Exception:
+            pass
+
+    def _persist_lib_sash(self, pane: ttk.PanedWindow) -> None:
+        try:
+            pos = pane.sashpos(0)
+            if pos > 0:
+                self._settings["lib_sash"] = pos
+                save_settings(self._settings)
+        except Exception:
+            pass
 
     # ── Refresh & filter ──────────────────────────────────────────────────────
 
@@ -3399,6 +5600,8 @@ class LibraryApp(tk.Tk):
     # ── Update checker ────────────────────────────────────────────────────────
 
     def _start_update_check(self) -> None:
+        if not self.net_ok("check_updates"):
+            return
         threading.Thread(target=self._fetch_latest_version, daemon=True).start()
 
     def _fetch_latest_version(self) -> None:
@@ -3427,17 +5630,22 @@ class LibraryApp(tk.Tk):
             self._upd_note_lbl.configure(
                 text="✓ Up to date", fg=FG_DIM)
 
-    def _on_update_toggle(self) -> None:
-        enabled = self._upd_var.get()
-        self._settings["check_updates"] = enabled
-        save_settings(self._settings)
-        if enabled:
-            self._upd_note_lbl.configure(text="")
-            self._start_update_check()
+    def net_ok(self, key: str) -> bool:
+        """Return True only if the feature is enabled AND lockdown is off."""
+        if self._settings.get("lockdown", True):
+            return False
+        default = bool(_SETTINGS_DEFAULTS.get(key, True))
+        return bool(self._settings.get(key, default))
+
+    def _update_lockdown_indicator(self) -> None:
+        locked = self._settings.get("lockdown", True)
+        if locked:
+            self._lockdown_lbl.configure(text="🔒 LOCKDOWN  (click to open Settings)")
         else:
-            self._upd_note_lbl.configure(
-                text="○  Updates disabled", fg=FG_DIM)
-            self._upd_note_lbl.unbind("<Button-1>")
+            self._lockdown_lbl.configure(text="")
+
+    def open_settings(self) -> None:
+        SettingsDialog(self)
 
     def _toggle_hidden(self) -> None:
         self._show_hidden = not self._show_hidden
@@ -3447,6 +5655,16 @@ class LibraryApp(tk.Tk):
 
     def _open_orphan_cleaner(self) -> None:
         OrphanedFilesDialog(self, self.groups, on_done=self.refresh)
+
+    def open_cookie_settings(self) -> None:
+        if not self.net_ok("allow_provider_login"):
+            messagebox.showinfo(
+                "Disabled",
+                "Provider logins are disabled.\n\n"
+                "Enable them in Settings → Connection.",
+                parent=self)
+            return
+        SiteCookiesDialog(self)
 
     def queue_extraction(self, archive: Archive) -> None:
         """Add an archive to the extraction queue, creating the window if needed."""
@@ -3488,5 +5706,6 @@ class LibraryApp(tk.Tk):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()   # required for PyInstaller multiprocessing
     app = LibraryApp()
     app.mainloop()

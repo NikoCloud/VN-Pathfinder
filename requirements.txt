@@ -1,2 +1,9 @@
 Pillow>=10.0.0
 pyinstaller>=6.0.0
+curl-cffi>=0.7.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+pywebview>=4.4.0
+# pythonnet 3.1.0rc0+ required for Python 3.14 (pywebview edgechromium backend on Windows)
+pythonnet>=3.1.0rc0
+bottle>=0.12.0
