@@ -60,8 +60,14 @@ Fetch rich game information — title, developer, synopsis, cover art, screensho
   - Byte-accurate progress bar with real-time MB/s and ETA
   - Cancel mid-extraction; post-completion **Clear** / **Clear & Delete ZIP** buttons
   - **Clear All & Delete ZIPs** for batch workflows
+- **RAR extraction** — automatic via 7-Zip if installed; graceful manual fallback with instructions if not
 - **Redundant archive detection** — finds ZIPs that already have an extracted counterpart, shows total wasted space, lets you bulk-delete in one click
-- **RAR patch support** — assign any archive as a patch for a specific game, preview files, apply with overwrite warnings
+- **Patch & Mod management** — non-destructive system for `.rpa`, `.rpy`, `.rpyc`, `.py`, and `.zip`/`.rar` patch archives
+  - **Assign** moves a patch from your library root into the game's `.patches/` folder
+  - **Enable / Disable toggles** in the Detail Panel move patches between `.patches/` (parked) and `game/` (active) — no copies, no permanent deletions
+  - **Collision handling** — rename dialog with auto-suggested `name_YYYY-MM-DD` when a patch name already exists
+  - **Version-aware** — patches are tracked per game version; switching versions in the Detail Panel shows that version's patch list
+  - **⟳ Sync** button reconciles the UI with the real filesystem state
 
 ### Maintenance
 - **Clean Orphaned Files** — scans library root for unrecognised items, lets you delete with checkboxes and size display
@@ -156,10 +162,11 @@ Open Settings (⚙ button, top toolbar) → **General** → set your game librar
 
 | Action | How |
 |--------|-----|
-| Extract a ZIP | Select it → **Extract** |
+| Extract a ZIP or RAR | Select it → **Extract** |
 | Delete already-extracted archives | Toolbar → **Delete Extracted (N) — X GB** |
-| Assign a RAR patch | Select it → **Assign as Patch for…** |
-| Apply a patch | Select it → **Apply Patch** |
+| Assign a patch or mod | Select it → **Assign as Patch for…** → pick game (and version if multiple) |
+| Enable / disable a patch | Game's Detail Panel → **Patches** section → toggle checkbox |
+| Sync patch state with disk | Game's Detail Panel → **⟳ Sync** |
 
 ### Settings
 
@@ -179,6 +186,7 @@ Open Settings (⚙ button, top toolbar) → **General** → set your game librar
 
 - Windows 10 / 11 (64-bit)
 - [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) — for the itch.io browser login. Already installed on most Windows 11 machines; Windows 10 users may need to install it manually.
+- [7-Zip](https://www.7-zip.org/) *(optional)* — enables automatic RAR patch extraction. If not installed, RAR files prompt for manual extraction instead.
 
 ---
 
@@ -205,6 +213,7 @@ Releases are built automatically by GitHub Actions on every version tag push.
 - [ ] Export library to CSV / JSON
 - [ ] Bulk tag assignment
 - [ ] Series / franchise grouping
+- [ ] Developer guide — best practices for packaging patches and mods for use with VN Pathfinder
 
 ---
 

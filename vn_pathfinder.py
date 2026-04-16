@@ -51,6 +51,12 @@ try:
 except ImportError:
     HAS_WEBVIEW = False
 
+try:
+    import rarfile as _rarfile              # type: ignore[import]
+    HAS_RARFILE = True
+except ImportError:
+    HAS_RARFILE = False
+
 
 # ── Version ────────────────────────────────────────────────────────────────────
 
@@ -578,6 +584,29 @@ def build_groups(
             groups[k] = GameGroup(base_key=k, display_name=disp, archives=[a])
 
     return sorted(groups.values(), key=lambda g: g.display_name.lower())
+
+
+def _find_7zip() -> str | None:
+    """Locate the 7-Zip command-line executable on Windows.
+
+    Checks PATH first, then the two standard Program Files locations.
+    Returns the full path string, or None if not found.
+    """
+    # 1. Already on PATH (e.g. user added it, or portable install)
+    found = shutil.which("7z")
+    if found:
+        return found
+
+    # 2. Standard Windows install locations
+    candidates = [
+        Path(os.environ.get("ProgramFiles",  r"C:\Program Files"))  / "7-Zip" / "7z.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "7-Zip" / "7z.exe",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+
+    return None
 
 
 def _patch_meta_key(base_key: str, version_str: str | None) -> str:
@@ -5405,16 +5434,7 @@ class ArchivesTab(ttk.Frame):
         if suffix == ".zip":
             self._assign_zip_patch(a, patches_dir, meta_key)
         elif suffix == ".rar":
-            patches_dir.mkdir(parents=True, exist_ok=True)
-            messagebox.showinfo(
-                "RAR Patch",
-                "RAR files cannot be extracted automatically.\n\n"
-                "Please:\n"
-                "1. Extract the RAR file manually with 7-Zip\n"
-                "2. Move the extracted folder into:\n"
-                f"   {patches_dir.relative_to(RENPY_DIR)}\n\n"
-                "Then use ⟳ Sync in the Detail Panel to pick it up.",
-                parent=self)
+            self._assign_rar_patch(a, patches_dir, meta_key)
         elif suffix in (".py", ".rpa", ".rpyc"):
             self._assign_loose_patch(a, patches_dir, meta_key)
         else:
@@ -5562,6 +5582,84 @@ class ArchivesTab(ttk.Frame):
                     shutil.move(str(item), str(dest_folder / item.name))
 
             # Delete original archive
+            try:
+                a.archive_path.unlink()
+            except Exception:
+                pass
+
+            ud = self._app.user_data
+            if meta_key not in ud.applied_patches:
+                ud.applied_patches[meta_key] = {}
+            ud.applied_patches[meta_key][patch_name] = False
+            save_userdata(ud)
+
+            messagebox.showinfo(
+                "Patch Assigned",
+                f"✓ Stored as:  .patches/{patch_name}/\n\n"
+                "Enable it from the game's Detail Panel.",
+                parent=self)
+            self._app.refresh()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _assign_rar_patch(self, a: Archive, patches_dir: Path, meta_key: str) -> None:
+        """Extract a RAR archive into a named folder in .patches/ using 7-Zip."""
+        seven_zip = _find_7zip()
+
+        if not HAS_RARFILE or not seven_zip:
+            # Graceful fallback — tell user exactly where to drop things
+            patches_dir.mkdir(parents=True, exist_ok=True)
+            missing = []
+            if not HAS_RARFILE:
+                missing.append("• rarfile  (pip install rarfile)")
+            if not seven_zip:
+                missing.append("• 7-Zip  (7-zip.org)")
+            messagebox.showinfo(
+                "RAR — Manual Extract Required",
+                "Automatic RAR extraction needs:\n"
+                + "\n".join(missing)
+                + "\n\nOnce installed, restart VN Pathfinder and try again.\n\n"
+                "Manual alternative:\n"
+                "1. Extract the RAR yourself with 7-Zip\n"
+                "2. Move the extracted folder into:\n"
+                f"   {patches_dir.relative_to(RENPY_DIR)}\n"
+                "3. Use ⟳ Sync in the Detail Panel to pick it up.",
+                parent=self)
+            return
+
+        tmp = Path(tempfile.mkdtemp(prefix="renpy_patch_"))
+        try:
+            try:
+                _rarfile.UNRAR_TOOL = seven_zip
+                with _rarfile.RarFile(str(a.archive_path)) as rf:
+                    rf.extractall(str(tmp))
+            except Exception as exc:
+                messagebox.showerror("RAR Extraction Error", str(exc), parent=self)
+                return
+
+            extracted = list(tmp.iterdir())
+            if not extracted:
+                messagebox.showwarning("Empty Archive",
+                                       "The RAR archive contains no files.", parent=self)
+                return
+
+            patch_name = a.archive_path.stem
+            patches_dir.mkdir(parents=True, exist_ok=True)
+
+            if (patches_dir / patch_name).exists():
+                patch_name = self._resolve_name_collision(patch_name, patches_dir)
+                if patch_name is None:
+                    return
+
+            dest_folder = patches_dir / patch_name
+
+            if len(extracted) == 1 and extracted[0].is_dir():
+                shutil.move(str(extracted[0]), str(dest_folder))
+            else:
+                dest_folder.mkdir(parents=True, exist_ok=True)
+                for item in extracted:
+                    shutil.move(str(item), str(dest_folder / item.name))
+
             try:
                 a.archive_path.unlink()
             except Exception:
