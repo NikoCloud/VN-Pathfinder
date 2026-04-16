@@ -287,6 +287,7 @@ class Archive:
     base_key: str
     version_str: str
     matched_folder: str | None = None
+    mod_time: str = ""  # ISO 8601 date string (YYYY-MM-DD)
 
 
 @dataclass
@@ -516,7 +517,14 @@ def scan_game_version(path: Path) -> GameVersion | None:
 
 def scan_archive(path: Path) -> Archive:
     base_key, version_str, _ = parse_folder_name(path.stem)
-    return Archive(archive_path=path, base_key=base_key, version_str=version_str)
+    try:
+        mtime = datetime.datetime.fromtimestamp(
+            path.stat().st_mtime, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%d")
+    except (OSError, ValueError):
+        mtime = ""
+    return Archive(archive_path=path, base_key=base_key, version_str=version_str,
+                   mod_time=mtime)
 
 
 def scan_all() -> list[GameGroup]:
@@ -531,7 +539,7 @@ def scan_all() -> list[GameGroup]:
             v = scan_game_version(e)
             if v:
                 versions.append(v)
-        elif e.suffix.lower() in (".zip", ".rar"):
+        elif e.suffix.lower() in (".zip", ".rar", ".py", ".rpa"):
             archives.append(scan_archive(e))
     return build_groups(versions, archives)
 
@@ -4825,7 +4833,7 @@ class ArchivesTab(ttk.Frame):
         # Toolbar
         tb = ttk.Frame(self, padding=(8, 6))
         tb.pack(fill="x")
-        ttk.Label(tb, text="ZIP / RAR archives — extract to add games to your library",
+        ttk.Label(tb, text="Archives (.zip, .rar, .py, .rpa) — extract or patch games",
                   foreground=FG_DIM, font=("Segoe UI", 9)).pack(side="left")
         ttk.Button(tb, text="⟳ Refresh",
                    command=self._app.refresh).pack(side="right", padx=(4, 0))
@@ -4837,20 +4845,24 @@ class ArchivesTab(ttk.Frame):
 
         ttk.Separator(self, orient="horizontal").pack(fill="x")
 
-        cols = ("size", "type", "status")
+        cols = ("size", "type", "modified", "status")
         self._tree = ttk.Treeview(
             self, columns=cols, show="tree headings", selectmode="browse")
         self._tree.heading("#0",     text="Name",   anchor="w")
         self._tree.heading("size",   text="Size",   anchor="center")
         self._tree.heading("type",   text="Type",   anchor="center")
+        self._tree.heading("modified", text="Modified", anchor="center")
         self._tree.heading("status", text="Status / Patch",  anchor="w")
-        self._tree.column("#0",     width=340, minwidth=200, stretch=True)
-        self._tree.column("size",   width=80,  anchor="center")
+        self._tree.column("#0",     width=320, minwidth=200, stretch=True)
+        self._tree.column("size",   width=70,  anchor="center")
         self._tree.column("type",   width=60,  anchor="center")
-        self._tree.column("status", width=200, anchor="w")
+        self._tree.column("modified", width=80, anchor="center")
+        self._tree.column("status", width=180, anchor="w")
 
         self._tree.tag_configure("zip",       foreground=YELLOW)
         self._tree.tag_configure("rar",       foreground=MAUVE)
+        self._tree.tag_configure("py",        foreground="#fab387")   # peach
+        self._tree.tag_configure("rpa",       foreground="#a6e3a1")   # green
         self._tree.tag_configure("extracted", foreground=GREEN)
         self._tree.tag_configure("patch",     foreground="#89dceb")
 
@@ -4932,7 +4944,7 @@ class ArchivesTab(ttk.Frame):
                 self._tree.insert(
                     "", "end",
                     text=a.archive_path.stem,
-                    values=(fmt_size, arc_type, status),
+                    values=(fmt_size, arc_type, a.mod_time, status),
                     tags=(tag,),
                     iid=str(a.archive_path),
                 )
@@ -5118,12 +5130,21 @@ class ArchivesTab(ttk.Frame):
         a = self._selected_archive()
         if not a:
             return
-        if a.archive_path.suffix.lower() == ".rar":
+        suffix = a.archive_path.suffix.lower()
+        if suffix == ".rar":
             messagebox.showinfo(
                 "RAR Archive",
                 "RAR files require 7-Zip to extract.\n\n"
-                "1. Extract the RAR manually to F:\\RenPy\\\n"
+                "1. Extract the RAR manually to your game library folder\n"
                 "2. Click Refresh to add the game to your library",
+                parent=self)
+            return
+        elif suffix in (".py", ".rpa"):
+            messagebox.showinfo(
+                "Patch File",
+                "This is a patch file, not a full game archive.\n\n"
+                "Use 'Assign as Patch for...' to link it to a game, "
+                "then 'Apply Patch' to apply it.",
                 parent=self)
             return
         self._app.queue_extraction(a)
