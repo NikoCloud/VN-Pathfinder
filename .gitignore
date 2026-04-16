@@ -8,3 +8,7 @@ __pycache__/
 # ── Runtime / local data (never committed) ────────────────────────────────────
 vn_pathfinder.json
 renpy_manager.json
+
+# ── Internal dev notes (never published) ──────────────────────────────────────
+Kyun.MD
+*.MD
