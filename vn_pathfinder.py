@@ -5362,7 +5362,7 @@ class ArchivesTab(ttk.Frame):
                              on_done=self._app.refresh)
 
         elif suffix in (".py", ".rpa"):
-            # Direct file patch — copy to game/game folder
+            # Direct file patch — move to game/game folder
             game_folder = target_version.folder_path / "game"
             if not game_folder.exists():
                 messagebox.showerror(
@@ -5374,16 +5374,16 @@ class ArchivesTab(ttk.Frame):
 
             try:
                 dest_path = game_folder / a.archive_path.name
-                shutil.copy2(a.archive_path, dest_path)
+                shutil.move(str(a.archive_path), str(dest_path))
                 messagebox.showinfo(
                     "Patch Applied",
-                    f"✓ Copied to:\n{dest_path.relative_to(RENPY_DIR)}",
+                    f"✓ Moved to:\n{dest_path.relative_to(RENPY_DIR)}",
                     parent=self)
                 self._app.refresh()
             except Exception as exc:
                 messagebox.showerror(
-                    "Copy Failed",
-                    f"Could not copy patch file:\n{exc}",
+                    "Move Failed",
+                    f"Could not move patch file:\n{exc}",
                     parent=self)
 
         else:
