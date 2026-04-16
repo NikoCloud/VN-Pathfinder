@@ -3,7 +3,7 @@
   <h1>VN Pathfinder</h1>
   <p>Your complete visual novel library manager — track, organise, launch, and maintain your RenPy collection.</p>
 
-  [![Download](https://img.shields.io/github/v/release/NikoCloud/VN-Pathfinder?label=Download&style=for-the-badge&color=f38ba8)](https://github.com/NikoCloud/VN-Pathfinder/releases/latest)
+  [![Download](https://img.shields.io/github/v/release/NikoCloud/VN-Pathfinder?label=Download&style=for-the-badge&color=f38ba8&include_prereleases)](https://github.com/NikoCloud/VN-Pathfinder/releases/latest)
   [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge)](https://github.com/NikoCloud/VN-Pathfinder/releases/latest)
   [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-yellow?style=for-the-badge)](https://www.python.org/)
   [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green?style=for-the-badge)](LICENSE)
