@@ -314,7 +314,8 @@ class UserData:
     custom_art: dict[str, str]       = field(default_factory=dict)   # base_key → path
     patch_assignments: dict[str, str] = field(default_factory=dict)  # archive_name → base_key
     # ── v3 fields: Patch management ────────────────────────────────────────
-    applied_patches: dict[str, dict[str, bool]] = field(default_factory=dict)  # base_key → {filename: active}
+    applied_patches: dict[str, dict[str, bool]] = field(default_factory=dict)
+    # "{base_key}::{version_str or '_'}" → {patch_name: active}
     custom_presets:   list[str]       = field(default_factory=list)   # user-promoted preset tags
 
 
@@ -579,25 +580,27 @@ def build_groups(
     return sorted(groups.values(), key=lambda g: g.display_name.lower())
 
 
-def auto_detect_patches(groups: list[GameGroup], ud: UserData) -> None:
-    """Scan game folders for .patches/ directory and populate applied_patches metadata."""
-    for g in groups:
-        if g.base_key not in ud.applied_patches:
-            ud.applied_patches[g.base_key] = {}
+def _patch_meta_key(base_key: str, version_str: str | None) -> str:
+    """Return a version-scoped key for applied_patches metadata."""
+    return f"{base_key}::{version_str or '_'}"
 
-        # Check each version's .patches/ folder
+
+def auto_detect_patches(groups: list[GameGroup], ud: UserData) -> None:
+    """Scan each game version's .patches/ folder and register new entries in metadata."""
+    for g in groups:
         for v in g.versions:
+            meta_key = _patch_meta_key(g.base_key, v.version_str)
+            if meta_key not in ud.applied_patches:
+                ud.applied_patches[meta_key] = {}
+
             patches_dir = v.folder_path / "game" / ".patches"
             if patches_dir.exists() and patches_dir.is_dir():
                 try:
                     for item in patches_dir.iterdir():
-                        # Only track files/folders that exist; skip special names
                         if item.name.startswith("."):
                             continue
-                        fname = item.name
-                        # Add to metadata if not already tracked (default inactive)
-                        if fname not in ud.applied_patches[g.base_key]:
-                            ud.applied_patches[g.base_key][fname] = False
+                        if item.name not in ud.applied_patches[meta_key]:
+                            ud.applied_patches[meta_key][item.name] = False
                 except OSError:
                     pass
 
@@ -636,7 +639,9 @@ def load_userdata() -> UserData:
             tags=raw.get("tags", {}),
             custom_art=raw.get("custom_art", {}),
             patch_assignments=raw.get("patch_assignments", {}),
-            applied_patches=raw.get("applied_patches", {}),
+            # v3→v4: applied_patches key format changed (base_key → base_key::version)
+            # Reset on migration so auto_detect_patches rebuilds from filesystem
+            applied_patches=raw.get("applied_patches", {}) if raw.get("version", 1) >= 4 else {},
             custom_presets=raw.get("custom_presets", []),
         )
     except (OSError, json.JSONDecodeError):
@@ -647,7 +652,7 @@ def save_userdata(ud: UserData) -> None:
     try:
         with open(USERDATA_FILE, "w", encoding="utf-8") as f:
             json.dump({
-                "version": 3,
+                "version": 4,
                 "notes": ud.notes,
                 "hidden": sorted(ud.hidden),
                 "manual_played": sorted(ud.manual_played),
@@ -3211,12 +3216,16 @@ class DetailPanel(ttk.Frame):
         ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=4)
 
         # ── Patches ──────────────────────────────────────────────────────────
+        self._patch_vars: list[tk.BooleanVar] = []   # strong refs prevent GC
+
         patch_header = tk.Frame(inner, bg=BG)
         patch_header.pack(fill="x")
         self._patch_indicator = tk.Label(
             patch_header, bg=BG, fg=FG_DIM, text="Patches",
             font=("Segoe UI", 8, "bold"))
         self._patch_indicator.pack(side="left")
+        ttk.Button(patch_header, text="⟳ Sync",
+                   command=self._sync_patches).pack(side="right")
 
         self._patch_frame = tk.Frame(inner, bg=BG)
         self._patch_frame.pack(fill="x", pady=(3, 4), padx=0)
@@ -3351,7 +3360,8 @@ class DetailPanel(ttk.Frame):
         self._car_counter.configure(text="")
         self._car_prev.configure(state="disabled")
         self._car_next.configure(state="disabled")
-        # Clear patch frame
+        # Clear patch frame and release BooleanVar refs
+        self._patch_vars.clear()
         for w in self._patch_frame.winfo_children():
             w.destroy()
 
@@ -3411,21 +3421,22 @@ class DetailPanel(ttk.Frame):
         self._notes._notes_key = key  # type: ignore[attr-defined]
 
     def _load_patches(self, ud: UserData) -> None:
-        """Load and display patches for the current game version."""
-        # Clear existing patch UI
+        """Load and display patches for the currently selected game version."""
+        self._patch_vars.clear()
         for w in self._patch_frame.winfo_children():
             w.destroy()
 
-        if not self._version:
+        if not self._version or not self._group:
             self._patch_indicator.configure(text="Patches", fg=FG_DIM)
             return
 
-        # Get patch info from metadata and filesystem
-        base_key = self._group.base_key if self._group else ""
-        patches_meta = ud.applied_patches.get(base_key, {})
+        base_key = self._group.base_key
+        meta_key = _patch_meta_key(base_key, self._version.version_str)
+        patches_meta = ud.applied_patches.get(meta_key, {})
         patches_dir = self._version.folder_path / "game" / ".patches"
 
-        # Collect actual patches from filesystem
+        # Filesystem is source of truth for what patches EXIST
+        # Metadata only stores the active boolean for each
         patch_list: list[tuple[str, bool]] = []
         if patches_dir.exists() and patches_dir.is_dir():
             try:
@@ -3437,18 +3448,24 @@ class DetailPanel(ttk.Frame):
             except OSError:
                 pass
 
-        # Update indicator with count
+        # Also surface patches currently active in game/ (moved there, not in .patches/)
+        game_folder = self._version.folder_path / "game"
+        for patch_name, is_active in list(patches_meta.items()):
+            if is_active and not any(n == patch_name for n, _ in patch_list):
+                # Patch is marked active and exists in game/ — show it
+                if (game_folder / patch_name).exists():
+                    patch_list.append((patch_name, True))
+
+        patch_list.sort(key=lambda x: x[0].lower())
+
         active_count = sum(1 for _, active in patch_list if active)
         if patch_list:
             self._patch_indicator.configure(
                 text=f"Patches ({active_count} active)",
                 fg=ACCENT if active_count > 0 else FG_DIM)
         else:
-            self._patch_indicator.configure(
-                text="Patches",
-                fg=FG_DIM)
+            self._patch_indicator.configure(text="Patches", fg=FG_DIM)
 
-        # Render patch toggles
         if not patch_list:
             tk.Label(self._patch_frame, bg=BG, fg=FG_MUT,
                      text="No patches", font=("Segoe UI", 8)).pack(side="left")
@@ -3461,8 +3478,9 @@ class DetailPanel(ttk.Frame):
         row = tk.Frame(self._patch_frame, bg=BG)
         row.pack(fill="x", pady=(2, 0))
 
-        # Checkbox / toggle
+        # Checkbox / toggle — var stored on self to prevent GC unlinking the widget
         var = tk.BooleanVar(value=is_active)
+        self._patch_vars.append(var)
 
         def _on_toggle(*_):
             if var.get():
@@ -3490,39 +3508,61 @@ class DetailPanel(ttk.Frame):
         patches_dir = self._version.folder_path / "game" / ".patches"
         patch_path = patches_dir / patch_name
         game_folder = self._version.folder_path / "game"
+        meta_key = _patch_meta_key(base_key, self._version.version_str)
 
         if not patch_path.exists():
             messagebox.showerror("Patch Not Found",
-                                f"Could not find patch:\n{patch_path}",
-                                parent=self)
+                                 f"Could not find patch:\n{patch_path}",
+                                 parent=self)
+            self._app.refresh()
             return
 
-        try:
-            dest_path = game_folder / patch_name
-            if dest_path.exists():
-                # Already active or conflict
-                messagebox.showwarning(
-                    "Already Active",
-                    f"Patch is already active in game folder.",
-                    parent=self)
-                return
+        dest_path = game_folder / patch_name
 
-            # For folders, copy; for files, move
-            if patch_path.is_dir():
-                shutil.copytree(str(patch_path), str(dest_path))
+        try:
+            if dest_path.exists():
+                if patch_path.is_dir() and dest_path.is_dir():
+                    # Offer merge for folder-on-folder collision
+                    if not messagebox.askyesno(
+                            "Folder Already Exists",
+                            f'"{patch_name}" already exists in the game folder.\n\n'
+                            "Merge patch contents into it?",
+                            parent=self):
+                        self._app.refresh()
+                        return
+                    # Merge: move each item; abort on inner collision
+                    for item in list(patch_path.iterdir()):
+                        target = dest_path / item.name
+                        if target.exists():
+                            messagebox.showerror(
+                                "Merge Conflict",
+                                f'Cannot merge: "{item.name}" already exists '
+                                f'inside "{patch_name}".\n\nResolve manually.',
+                                parent=self)
+                            self._app.refresh()
+                            return
+                        shutil.move(str(item), str(target))
+                    patch_path.rmdir()
+                else:
+                    messagebox.showerror(
+                        "Conflict",
+                        f'"{patch_name}" already exists in the game folder.\n\n'
+                        "Disable or remove the existing entry first.",
+                        parent=self)
+                    self._app.refresh()
+                    return
             else:
                 shutil.move(str(patch_path), str(dest_path))
 
-            # Update metadata
             ud = self._app.user_data
-            if base_key not in ud.applied_patches:
-                ud.applied_patches[base_key] = {}
-            ud.applied_patches[base_key][patch_name] = True
+            if meta_key not in ud.applied_patches:
+                ud.applied_patches[meta_key] = {}
+            ud.applied_patches[meta_key][patch_name] = True
             save_userdata(ud)
-
-            self._app.refresh()
         except Exception as exc:
             messagebox.showerror("Error Enabling Patch", str(exc), parent=self)
+        finally:
+            self._app.refresh()
 
     def _disable_patch(self, base_key: str, patch_name: str) -> None:
         """Move patch from game/ back to .patches/ (deactivate it)."""
@@ -3532,36 +3572,79 @@ class DetailPanel(ttk.Frame):
         patches_dir = self._version.folder_path / "game" / ".patches"
         game_folder = self._version.folder_path / "game"
         game_path = game_folder / patch_name
+        meta_key = _patch_meta_key(base_key, self._version.version_str)
 
         if not game_path.exists():
-            messagebox.showerror("Patch Not Found",
-                                f"Could not find patch in game folder:\n{game_path}",
-                                parent=self)
+            # Stale metadata — offer to clear
+            if messagebox.askyesno(
+                    "Patch Not Found",
+                    f'"{patch_name}" was not found in the game folder.\n\n'
+                    "The record may be stale. Clear it?",
+                    parent=self):
+                ud = self._app.user_data
+                ud.applied_patches.get(meta_key, {}).pop(patch_name, None)
+                save_userdata(ud)
+            self._app.refresh()
             return
 
         try:
-            # Ensure patches_dir exists
             patches_dir.mkdir(parents=True, exist_ok=True)
-
             dest_path = patches_dir / patch_name
+            shutil.move(str(game_path), str(dest_path))
 
-            # For folders, delete from game (keep backup in .patches/); for files, move
-            if game_path.is_dir():
-                # Just delete from game/ since we have the backup in .patches/
-                shutil.rmtree(str(game_path))
-            else:
-                shutil.move(str(game_path), str(dest_path))
-
-            # Update metadata
             ud = self._app.user_data
-            if base_key not in ud.applied_patches:
-                ud.applied_patches[base_key] = {}
-            ud.applied_patches[base_key][patch_name] = False
+            if meta_key not in ud.applied_patches:
+                ud.applied_patches[meta_key] = {}
+            ud.applied_patches[meta_key][patch_name] = False
             save_userdata(ud)
-
-            self._app.refresh()
         except Exception as exc:
             messagebox.showerror("Error Disabling Patch", str(exc), parent=self)
+        finally:
+            self._app.refresh()
+
+    def _sync_patches(self) -> None:
+        """Re-read filesystem and reconcile applied_patches metadata for current version."""
+        if not self._version or not self._group:
+            return
+
+        base_key = self._group.base_key
+        meta_key = _patch_meta_key(base_key, self._version.version_str)
+        patches_dir = self._version.folder_path / "game" / ".patches"
+        game_folder = self._version.folder_path / "game"
+        ud = self._app.user_data
+        current_meta = ud.applied_patches.get(meta_key, {})
+        new_meta: dict[str, bool] = {}
+
+        # Inactive patches: items currently sitting in .patches/
+        if patches_dir.exists() and patches_dir.is_dir():
+            try:
+                for item in patches_dir.iterdir():
+                    if not item.name.startswith("."):
+                        new_meta[item.name] = False
+            except OSError:
+                pass
+
+        # Active patches: items our metadata says are active AND still exist in game/
+        stale: list[str] = []
+        for patch_name, is_active in current_meta.items():
+            if is_active:
+                if (game_folder / patch_name).exists():
+                    new_meta[patch_name] = True
+                else:
+                    stale.append(patch_name)
+
+        removed = len(current_meta) - len(new_meta)
+        ud.applied_patches[meta_key] = new_meta
+        save_userdata(ud)
+        self._app.refresh()
+
+        parts: list[str] = [f"{len(new_meta)} patch(es) found."]
+        if removed > 0:
+            parts.append(f"{removed} stale entr{'y' if removed == 1 else 'ies'} removed.")
+        if stale:
+            parts.append("\nPatch(es) marked active but missing from game folder:\n"
+                         + "\n".join(f"  • {p}" for p in stale))
+        messagebox.showinfo("Sync Complete", "\n".join(parts), parent=self)
 
     def _load_art(self, g: GameGroup, ud: UserData,
                   tc: ThumbnailCache) -> None:
@@ -3945,7 +4028,9 @@ class DetailPanel(ttk.Frame):
             if (v.version_str or "—") == sel:
                 self._version = v
                 break
-        self._refresh_stats(self._app.user_data)
+        ud = self._app.user_data
+        self._refresh_stats(ud)
+        self._load_patches(ud)
         self._refresh_metadata_display()
 
     def _launch(self) -> None:
@@ -5296,254 +5381,235 @@ class ArchivesTab(ttk.Frame):
         lb.bind("<Double-1>", lambda _: _confirm())
 
     def _process_patch_assignment(self, a: Archive, chosen_key: str) -> None:
-        """Extract patch to temp, check for collision, move to game's .patches/ folder."""
-        # Find target game version
+        """Route patch to the correct version's .patches/ folder."""
         target_group = next(
             (g for g in self._app.groups if g.base_key == chosen_key and g.versions),
             None)
         if not target_group:
-            messagebox.showerror(
-                "Game Not Found",
-                "The selected game could not be found.",
-                parent=self)
+            messagebox.showerror("Game Not Found",
+                                 "The selected game could not be found.", parent=self)
             return
 
-        target_version = target_group.versions[-1]  # newest version
+        # Version picker when game has more than one installed version
+        if len(target_group.versions) > 1:
+            target_version = self._pick_patch_version(target_group)
+            if target_version is None:
+                return
+        else:
+            target_version = target_group.versions[-1]
+
         patches_dir = target_version.folder_path / "game" / ".patches"
-
-        # Ensure .patches directory exists
-        patches_dir.mkdir(parents=True, exist_ok=True)
-
+        meta_key = _patch_meta_key(chosen_key, target_version.version_str)
         suffix = a.archive_path.suffix.lower()
 
-        # For ZIP/RAR, extract to temp first
-        if suffix in (".zip", ".rar"):
-            tmp = Path(tempfile.mkdtemp(prefix="renpy_patch_"))
-            try:
-                if suffix == ".zip":
-                    try:
-                        with zipfile.ZipFile(a.archive_path) as zf:
-                            zf.extractall(tmp)
-                    except Exception as exc:
-                        messagebox.showerror("ZIP Extraction Error", str(exc), parent=self)
-                        return
-                else:  # .rar
-                    messagebox.showinfo(
-                        "RAR Patch",
-                        "RAR files cannot be extracted automatically.\n\n"
-                        "Please:\n"
-                        "1. Extract the RAR file manually with 7-Zip\n"
-                        "2. Then move the extracted contents to:\n"
-                        f"{patches_dir.relative_to(RENPY_DIR)}",
-                        parent=self)
-                    return
+        if suffix == ".zip":
+            self._assign_zip_patch(a, patches_dir, meta_key)
+        elif suffix == ".rar":
+            patches_dir.mkdir(parents=True, exist_ok=True)
+            messagebox.showinfo(
+                "RAR Patch",
+                "RAR files cannot be extracted automatically.\n\n"
+                "Please:\n"
+                "1. Extract the RAR file manually with 7-Zip\n"
+                "2. Move the extracted folder into:\n"
+                f"   {patches_dir.relative_to(RENPY_DIR)}\n\n"
+                "Then use ⟳ Sync in the Detail Panel to pick it up.",
+                parent=self)
+        elif suffix in (".py", ".rpa", ".rpyc"):
+            self._assign_loose_patch(a, patches_dir, meta_key)
+        else:
+            messagebox.showinfo("Unsupported Format",
+                                f"Cannot handle {suffix} patches.", parent=self)
 
-                # Collected extracted items
-                extracted_items = list(tmp.iterdir())
-                if not extracted_items:
-                    messagebox.showwarning("Empty Archive", "The archive contains no files.", parent=self)
-                    return
+    def _pick_patch_version(self, group: "GameGroup") -> "GameVersion | None":
+        """Modal dialog to choose which installed version to assign a patch to."""
+        result: list = [None]
 
-                # Prompt for collision if needed
-                # Check what items will be moved
-                items_to_move = []
-                if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                    # Single folder — move its contents
-                    items_to_move = list(extracted_items[0].iterdir())
-                else:
-                    # Multiple items — move all
-                    items_to_move = extracted_items
+        dlg = tk.Toplevel(self)
+        dlg.title("Select Version")
+        dlg.configure(bg=BG)
+        dlg.geometry("340x230")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
 
-                # Check for collisions
-                collisions = [item.name for item in items_to_move
-                             if (patches_dir / item.name).exists()]
+        ttk.Label(dlg, text=f"Game:  {group.display_name}",
+                  font=("Segoe UI", 9, "bold")).pack(padx=16, pady=(16, 4), anchor="w")
+        ttk.Label(dlg, text="Select the version to patch:",
+                  foreground=FG_DIM).pack(padx=16, anchor="w")
 
-                if collisions:
-                    # Suggest a base name for all items
-                    suggested_base = self._suggest_patch_name(a.archive_path, patches_dir)
-                    # Strip extension from suggestion for base name
-                    suggested_base = Path(suggested_base).stem
+        lf = ttk.Frame(dlg)
+        lf.pack(fill="both", expand=True, padx=16, pady=8)
+        lb = tk.Listbox(lf, bg=BG2, fg=FG, selectbackground=SEL,
+                        selectforeground=ACCENT, activestyle="none",
+                        relief="flat", bd=0, font=("Segoe UI", 9))
+        lb.pack(fill="both", expand=True)
+        for v in group.versions:
+            lb.insert("end", v.version_str or v.folder_name)
+        lb.selection_set(lb.size() - 1)
+        lb.see(lb.size() - 1)
 
-                    dlg = tk.Toplevel(self)
-                    dlg.title("Patch Name Collision")
-                    dlg.configure(bg=BG)
-                    dlg.geometry("500x200")
-                    dlg.resizable(False, False)
-                    dlg.transient(self)
-                    dlg.grab_set()
+        def _confirm():
+            sel = lb.curselection()
+            if sel:
+                result[0] = group.versions[sel[0]]
+            dlg.destroy()
 
-                    ttk.Label(dlg, text="These patch files already exist:",
-                              font=("Segoe UI", 9, "bold")).pack(padx=16, pady=(16, 4), anchor="w")
-                    ttk.Label(dlg, text=", ".join(collisions),
-                              foreground=FG_DIM, wraplength=450).pack(padx=16, pady=(0, 8), anchor="w")
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=16, pady=(0, 16))
+        ttk.Button(bf, text="Select", style="Accent.TButton",
+                   command=_confirm).pack(side="left", padx=(0, 8))
+        ttk.Button(bf, text="Cancel",
+                   command=dlg.destroy).pack(side="left")
+        lb.bind("<Double-1>", lambda _: _confirm())
+        dlg.wait_window()
+        return result[0]
 
-                    ttk.Label(dlg, text="Enter a folder or prefix name for this patch:",
-                              foreground=FG_DIM).pack(padx=16, anchor="w")
+    def _resolve_name_collision(self, current_name: str, target_dir: Path) -> "str | None":
+        """Prompt user to rename a patch when the target name already exists.
 
-                    name_var = tk.StringVar(value=suggested_base)
-                    entry = ttk.Entry(dlg, textvariable=name_var, width=40)
-                    entry.pack(padx=16, pady=(8, 16), anchor="w")
-                    entry.selection_range(0, "end")
-                    entry.focus()
-
-                    def _confirm_rename():
-                        new_base = name_var.get().strip()
-                        if not new_base:
-                            messagebox.showwarning("Invalid Name", "Please enter a name.", parent=dlg)
-                            return
-                        dlg.destroy()
-                        # Move items with new base name
-                        self._move_extracted_items(items_to_move, patches_dir, new_base)
-                        # Delete original archive
-                        try:
-                            a.archive_path.unlink()
-                        except Exception:
-                            pass
-                        messagebox.showinfo(
-                            "Patch Assigned",
-                            f"✓ Patch moved to:\n{patches_dir.relative_to(RENPY_DIR)}/",
-                            parent=self)
-                        # Record in metadata
-                        ud = self._app.user_data
-                        if chosen_key not in ud.applied_patches:
-                            ud.applied_patches[chosen_key] = {}
-                        for item in items_to_move:
-                            new_name = f"{new_base}/{item.name}" if len(items_to_move) > 1 else f"{new_base}"
-                            ud.applied_patches[chosen_key][new_name] = True
-                        save_userdata(ud)
-                        self._app.refresh()
-
-                    bf = ttk.Frame(dlg)
-                    bf.pack(fill="x", padx=16, pady=(0, 16))
-                    ttk.Button(bf, text="Rename", style="Accent.TButton",
-                               command=_confirm_rename).pack(side="left", padx=(0, 8))
-                    ttk.Button(bf, text="Cancel",
-                               command=dlg.destroy).pack(side="left")
-                else:
-                    # No collision — move directly
-                    self._move_extracted_items(items_to_move, patches_dir, None)
-                    # Delete original archive
-                    try:
-                        a.archive_path.unlink()
-                    except Exception:
-                        pass
-                    messagebox.showinfo(
-                        "Patch Assigned",
-                        f"✓ Patch moved to:\n{patches_dir.relative_to(RENPY_DIR)}/",
-                        parent=self)
-                    # Record in metadata
-                    ud = self._app.user_data
-                    if chosen_key not in ud.applied_patches:
-                        ud.applied_patches[chosen_key] = {}
-                    for item in items_to_move:
-                        ud.applied_patches[chosen_key][item.name] = True
-                    save_userdata(ud)
-                    self._app.refresh()
-
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-
-        elif suffix in (".py", ".rpa"):
-            # Direct file patch — just move
-            final_name = a.archive_path.name
-            dest_path = patches_dir / final_name
-
-            if dest_path.exists():
-                # Collision for single file
-                suggested_name = self._suggest_patch_name(a.archive_path, patches_dir)
-
-                dlg = tk.Toplevel(self)
-                dlg.title("Patch Name Collision")
-                dlg.configure(bg=BG)
-                dlg.geometry("460x180")
-                dlg.resizable(False, False)
-                dlg.transient(self)
-                dlg.grab_set()
-
-                ttk.Label(dlg, text="A patch with this name already exists.",
-                          font=("Segoe UI", 9, "bold")).pack(padx=16, pady=(16, 4), anchor="w")
-                ttk.Label(dlg, text="Enter a new name for this patch:",
-                          foreground=FG_DIM).pack(padx=16, anchor="w")
-
-                name_var = tk.StringVar(value=suggested_name)
-                entry = ttk.Entry(dlg, textvariable=name_var, width=40)
-                entry.pack(padx=16, pady=(8, 16), anchor="w")
-                entry.selection_range(0, "end")
-                entry.focus()
-
-                def _confirm_rename():
-                    new_name = name_var.get().strip()
-                    if not new_name:
-                        messagebox.showwarning("Invalid Name", "Please enter a name.", parent=dlg)
-                        return
-                    dlg.destroy()
-                    try:
-                        shutil.move(str(a.archive_path), str(patches_dir / new_name))
-                        messagebox.showinfo(
-                            "Patch Assigned",
-                            f"✓ Patch moved to:\n{(patches_dir / new_name).relative_to(RENPY_DIR)}",
-                            parent=self)
-                        # Record in metadata
-                        ud = self._app.user_data
-                        if chosen_key not in ud.applied_patches:
-                            ud.applied_patches[chosen_key] = {}
-                        ud.applied_patches[chosen_key][new_name] = True
-                        save_userdata(ud)
-                        self._app.refresh()
-                    except Exception as exc:
-                        messagebox.showerror("Move Error", str(exc), parent=self)
-
-                bf = ttk.Frame(dlg)
-                bf.pack(fill="x", padx=16, pady=(0, 16))
-                ttk.Button(bf, text="Rename", style="Accent.TButton",
-                           command=_confirm_rename).pack(side="left", padx=(0, 8))
-                ttk.Button(bf, text="Cancel",
-                           command=dlg.destroy).pack(side="left")
-            else:
-                # No collision — move directly
-                try:
-                    shutil.move(str(a.archive_path), str(dest_path))
-                    messagebox.showinfo(
-                        "Patch Assigned",
-                        f"✓ Patch moved to:\n{dest_path.relative_to(RENPY_DIR)}",
-                        parent=self)
-                    # Record in metadata
-                    ud = self._app.user_data
-                    if chosen_key not in ud.applied_patches:
-                        ud.applied_patches[chosen_key] = {}
-                    ud.applied_patches[chosen_key][final_name] = True
-                    save_userdata(ud)
-                    self._app.refresh()
-                except Exception as exc:
-                    messagebox.showerror("Move Error", str(exc), parent=self)
-
-    def _suggest_patch_name(self, patch_path: Path, target_dir: Path) -> str:
-        """Generate a suggested patch filename with date if collision exists."""
-        ext = patch_path.suffix
+        Returns the chosen name, or None if cancelled.
+        The suggested default is '<stem>_YYYY-MM-DD[.ext]'.
+        """
+        stem = Path(current_name).stem
+        ext  = Path(current_name).suffix
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        suggested = f"patch_{today}{ext}"
-
-        # If that also exists, try with version counter
+        suggested = f"{stem}_{today}{ext}"
         counter = 1
         while (target_dir / suggested).exists():
-            suggested = f"patch_{today}_v{counter}{ext}"
+            suggested = f"{stem}_{today}_v{counter}{ext}"
             counter += 1
 
-        return suggested
+        result: list = [None]
 
-    def _move_extracted_items(self, items: list[Path], target_dir: Path, base_name: str | None) -> None:
-        """Move extracted items to target directory, optionally organizing into a subfolder."""
-        if base_name:
-            # Create subfolder and move items into it
-            subfolder = target_dir / base_name
-            subfolder.mkdir(parents=True, exist_ok=True)
-            for item in items:
-                shutil.move(str(item), str(subfolder / item.name))
-        else:
-            # Move items directly to target
-            for item in items:
-                dest = target_dir / item.name
-                shutil.move(str(item), str(dest))
+        dlg = tk.Toplevel(self)
+        dlg.title("Name Already Exists")
+        dlg.configure(bg=BG)
+        dlg.geometry("460x185")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text=f'"{current_name}" already exists in .patches/.',
+                  font=("Segoe UI", 9, "bold")).pack(padx=16, pady=(16, 4), anchor="w")
+        ttk.Label(dlg, text="Enter a new name:",
+                  foreground=FG_DIM).pack(padx=16, anchor="w")
+
+        name_var = tk.StringVar(value=suggested)
+        entry = ttk.Entry(dlg, textvariable=name_var, width=44)
+        entry.pack(padx=16, pady=(6, 16), anchor="w")
+        entry.selection_range(0, "end")
+        entry.focus()
+
+        def _confirm():
+            new_name = name_var.get().strip()
+            if not new_name:
+                messagebox.showwarning("Invalid Name", "Please enter a name.", parent=dlg)
+                return
+            if (target_dir / new_name).exists():
+                messagebox.showwarning("Name Taken",
+                                       f'"{new_name}" also already exists.', parent=dlg)
+                return
+            result[0] = new_name
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(fill="x", padx=16, pady=(0, 16))
+        ttk.Button(bf, text="Rename", style="Accent.TButton",
+                   command=_confirm).pack(side="left", padx=(0, 8))
+        ttk.Button(bf, text="Cancel",
+                   command=dlg.destroy).pack(side="left")
+        entry.bind("<Return>", lambda _: _confirm())
+        dlg.wait_window()
+        return result[0]
+
+    def _assign_zip_patch(self, a: Archive, patches_dir: Path, meta_key: str) -> None:
+        """Extract ZIP into a named folder inside .patches/ then record as inactive."""
+        tmp = Path(tempfile.mkdtemp(prefix="renpy_patch_"))
+        try:
+            try:
+                with zipfile.ZipFile(a.archive_path) as zf:
+                    zf.extractall(tmp)
+            except Exception as exc:
+                messagebox.showerror("ZIP Extraction Error", str(exc), parent=self)
+                return
+
+            extracted = list(tmp.iterdir())
+            if not extracted:
+                messagebox.showwarning("Empty Archive",
+                                       "The archive contains no files.", parent=self)
+                return
+
+            patch_name = a.archive_path.stem
+            patches_dir.mkdir(parents=True, exist_ok=True)
+
+            # Collision check
+            if (patches_dir / patch_name).exists():
+                patch_name = self._resolve_name_collision(patch_name, patches_dir)
+                if patch_name is None:
+                    return
+
+            dest_folder = patches_dir / patch_name
+
+            # If ZIP contains exactly one top-level folder, move it directly
+            # (avoids double-nesting e.g. .patches/mod/mod/...)
+            if len(extracted) == 1 and extracted[0].is_dir():
+                shutil.move(str(extracted[0]), str(dest_folder))
+            else:
+                # Multiple items — wrap in named folder
+                dest_folder.mkdir(parents=True, exist_ok=True)
+                for item in extracted:
+                    shutil.move(str(item), str(dest_folder / item.name))
+
+            # Delete original archive
+            try:
+                a.archive_path.unlink()
+            except Exception:
+                pass
+
+            ud = self._app.user_data
+            if meta_key not in ud.applied_patches:
+                ud.applied_patches[meta_key] = {}
+            ud.applied_patches[meta_key][patch_name] = False
+            save_userdata(ud)
+
+            messagebox.showinfo(
+                "Patch Assigned",
+                f"✓ Stored as:  .patches/{patch_name}/\n\n"
+                "Enable it from the game's Detail Panel.",
+                parent=self)
+            self._app.refresh()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _assign_loose_patch(self, a: Archive, patches_dir: Path, meta_key: str) -> None:
+        """Move a loose .rpa/.rpy/.rpyc/.py file directly into .patches/."""
+        patches_dir.mkdir(parents=True, exist_ok=True)
+        patch_name = a.archive_path.name
+
+        if (patches_dir / patch_name).exists():
+            patch_name = self._resolve_name_collision(patch_name, patches_dir)
+            if patch_name is None:
+                return
+
+        try:
+            shutil.move(str(a.archive_path), str(patches_dir / patch_name))
+        except Exception as exc:
+            messagebox.showerror("Move Error", str(exc), parent=self)
+            return
+
+        ud = self._app.user_data
+        if meta_key not in ud.applied_patches:
+            ud.applied_patches[meta_key] = {}
+        ud.applied_patches[meta_key][patch_name] = False
+        save_userdata(ud)
+
+        messagebox.showinfo(
+            "Patch Assigned",
+            f"✓ Stored as:  .patches/{patch_name}\n\n"
+            "Enable it from the game's Detail Panel.",
+            parent=self)
+        self._app.refresh()
 
 
 
