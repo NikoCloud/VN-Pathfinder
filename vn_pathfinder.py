@@ -5360,6 +5360,32 @@ class ArchivesTab(ttk.Frame):
                 return
             PatchApplyDialog(self, Path(folder), target_version,
                              on_done=self._app.refresh)
+
+        elif suffix in (".py", ".rpa"):
+            # Direct file patch — copy to game/game folder
+            game_folder = target_version.folder_path / "game"
+            if not game_folder.exists():
+                messagebox.showerror(
+                    "Game Folder Not Found",
+                    f"Could not find game folder at:\n{game_folder}\n\n"
+                    "Make sure the game is extracted first.",
+                    parent=self)
+                return
+
+            try:
+                dest_path = game_folder / a.archive_path.name
+                shutil.copy2(a.archive_path, dest_path)
+                messagebox.showinfo(
+                    "Patch Applied",
+                    f"✓ Copied to:\n{dest_path.relative_to(RENPY_DIR)}",
+                    parent=self)
+                self._app.refresh()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Copy Failed",
+                    f"Could not copy patch file:\n{exc}",
+                    parent=self)
+
         else:
             messagebox.showinfo(
                 "Unsupported Format",
