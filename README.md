@@ -19,6 +19,16 @@ Everything runs locally. No accounts. No telemetry. **Zero network access by def
 
 ---
 
+## 🚀 VN Pathfinder 2.0 — Coming Soon
+
+We're building a **complete rewrite** of VN Pathfinder using **Flutter** for true cross-platform support (Windows, macOS, Linux) with a modern UI and blazing-fast performance.
+
+**[→ Follow VN Pathfinder 2.0 Development](https://github.com/NikoCloud/vn-pathfinder-flutter)**
+
+1.0 is stable and feature-complete. 2.0 is in active development with the goal of reaching feature parity and beyond. Check out the 2.0 repo to see the roadmap, or [read the vision here](https://github.com/NikoCloud/vn-pathfinder-flutter#-why-flutter-why-now).
+
+---
+
 ## Features
 
 ### Library
