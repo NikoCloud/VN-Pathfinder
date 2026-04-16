@@ -231,6 +231,7 @@ _SETTINGS_DEFAULTS: dict[str, object] = {
     "check_updates":        True,
     "fetch_metadata":       True,
     "allow_provider_login": True,
+    "allow_download_links": True,
     "lockdown":             True,   # ON by default; persists once user disables it
 }
 
@@ -256,14 +257,15 @@ class GameVersion:
 @dataclass
 class MetadataCandidate:
     """A single search result returned by a provider before the user picks one."""
-    source:    str          # "vndb" | "f95zone" | "lewdcorner"
-    title:     str
-    url:       str
-    developer: str = ""
-    synopsis:  str = ""
-    cover_url: str = ""
-    tags:      list[str] = field(default_factory=list)
-    extra:     dict      = field(default_factory=dict)   # source-specific raw fields
+    source:          str          # "vndb" | "f95zone" | "lewdcorner"
+    title:           str
+    url:             str
+    developer:       str       = ""
+    synopsis:        str       = ""
+    cover_url:       str       = ""
+    tags:            list[str] = field(default_factory=list)
+    screenshot_urls: list[str] = field(default_factory=list)   # additional images
+    extra:           dict      = field(default_factory=dict)   # source-specific raw fields
 
 
 @dataclass
@@ -700,6 +702,22 @@ def _group_art_path(g: GameGroup, ud: UserData) -> Path | None:
     return None
 
 
+def _group_carousel_paths(g: GameGroup, ud: UserData) -> list[Path]:
+    """Return ordered list of image paths for the carousel.
+    First entry is the cover (same as _group_art_path); subsequent entries are
+    screenshots stored in .vnpf/screenshot_N.* — sorted by filename."""
+    cover = _group_art_path(g, ud)
+    paths: list[Path] = [cover] if cover else []
+    for v in reversed(g.versions):
+        vnpf = _vnpf_dir(v.folder_path)
+        shots = sorted(vnpf.glob("screenshot_*.*"),
+                       key=lambda p: p.stem)
+        for s in shots:
+            if s not in paths:
+                paths.append(s)
+    return paths
+
+
 def _pil_load(path: Path, w: int, h: int):
     """Load + resize with PIL. Must be called from background thread."""
     with Image.open(path) as img:
@@ -739,23 +757,59 @@ def save_game_metadata(folder_path: Path, meta: dict) -> None:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
 
+def _download_image(url: str, dest: Path, timeout: int = SCRAPER_TIMEOUT) -> bool:
+    """Download a single image URL to dest. Returns True on success."""
+    try:
+        resp = _req.get(url, impersonate="chrome131", timeout=timeout)
+        resp.raise_for_status()
+        dest.parent.mkdir(exist_ok=True)
+        with open(dest, "wb") as fh:
+            fh.write(resp.content)
+        return True
+    except Exception:
+        return False
+
+
 def _download_cover(url: str, folder_path: Path) -> Path | None:
     """Download cover art to .vnpf/cover.jpg (or .png). Returns saved path."""
     if not HAS_SCRAPING or not url:
         return None
-    try:
+    ext = ".png" if url.lower().endswith(".png") else ".jpg"
+    dest = _vnpf_dir(folder_path) / f"cover{ext}"
+    return dest if _download_image(url, dest) else None
+
+
+def _download_screenshots(urls: list[str], folder_path: Path) -> list[str]:
+    """Download screenshot images to .vnpf/screenshot_N.jpg/.png in parallel.
+    Returns list of filenames that were saved (relative to .vnpf/), sorted."""
+    if not HAS_SCRAPING or not urls:
+        return []
+    vnpf = _vnpf_dir(folder_path)
+    vnpf.mkdir(exist_ok=True)
+    # Remove stale screenshots from a previous fetch
+    for old in vnpf.glob("screenshot_*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    items = list(enumerate(urls[:18], start=1))
+    results: dict[int, str] = {}   # idx → filename if saved
+
+    def _dl(i: int, url: str) -> None:
         ext = ".png" if url.lower().endswith(".png") else ".jpg"
-        dest = _vnpf_dir(folder_path) / f"cover{ext}"
-        _vnpf_dir(folder_path).mkdir(exist_ok=True)
-        headers = {"User-Agent": SCRAPER_UA}
-        resp = _req.get(url, headers=headers, timeout=SCRAPER_TIMEOUT, stream=True)
-        resp.raise_for_status()
-        with open(dest, "wb") as fh:
-            for chunk in resp.iter_content(65536):
-                fh.write(chunk)
-        return dest
-    except Exception:
-        return None
+        dest = vnpf / f"screenshot_{i}{ext}"
+        if _download_image(url, dest, timeout=8):
+            results[i] = dest.name
+
+    threads = [threading.Thread(target=_dl, args=(i, u), daemon=True)
+               for i, u in items]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)   # overall cap regardless of individual timeouts
+
+    return [results[i] for i in sorted(results)]
 
 
 def _strip_bbcode(text: str) -> str:
@@ -971,17 +1025,57 @@ class F95ZoneProvider:
             soup.select_one(".message-body .bbWrapper") or
             soup.select_one(".bbWrapper")
         )
+        # Scope image extraction to the first post only (prevents picking up
+        # images from replies, signature blocks, and user avatars).
+        first_post_el = (
+            soup.select_one("article.message--first") or
+            soup.select_one(".message--first") or
+            body_el
+        )
+        first_post_html = str(first_post_el) if first_post_el else ""
+
         synopsis = cover_url = ""
         tags: list[str] = []
+        screenshot_urls: list[str] = []
+
+        # Images: F95Zone lazy-loads via JS — img[data-src] is injected at runtime
+        # and does NOT appear in BeautifulSoup's parsed tree.  Instead, extract
+        # attachment URLs directly from the raw HTML with a regex.
+        # Full-size attachments never have '/thumb/' in the path; thumbnail copies do.
+        _seen: set[str] = set()
+        _att_pat = re.compile(r'https://attachments\.f95zone\.to/[^\s"\'<>]+')
+        for u in _att_pat.findall(first_post_html):
+            if '/thumb/' in u or u in _seen:
+                continue
+            # Skip common noise (emoticons, awards badges, etc.)
+            if any(x in u for x in ('smilies', 'emoji', '/awards/')):
+                continue
+            _seen.add(u)
+            if not cover_url:
+                cover_url = u
+            else:
+                screenshot_urls.append(u)
+            if len(screenshot_urls) >= 18:          # 1 cover + 18 = 19 total
+                break
+        # Fallback: external images (imgur, etc.) referenced via data-src in raw HTML
+        if not cover_url:
+            _ext_pat = re.compile(
+                r'data-src="(https://(?!attachments\.f95zone)[^\s"<>]+\.'
+                r'(?:jpg|jpeg|png|webp|gif)(?:\?[^\s"<>]*)?)"',
+                re.IGNORECASE,
+            )
+            for u in _ext_pat.findall(first_post_html):
+                if any(x in u for x in ('smilies', 'emoji')) or u in _seen:
+                    continue
+                _seen.add(u)
+                if not cover_url:
+                    cover_url = u
+                else:
+                    screenshot_urls.append(u)
+                if len(screenshot_urls) >= 18:
+                    break
 
         if body_el:
-            # Cover: first sizeable image; F95 uses lazy-load data-src
-            for img_el in body_el.select("img[src], img[data-src]"):
-                src = img_el.get("src") or img_el.get("data-src", "")
-                if (src and src.startswith("http")
-                        and "smilies" not in src and "emoji" not in src):
-                    cover_url = src
-                    break
             # Synopsis: first paragraph with real text
             for el in body_el.select("p, div"):
                 t = el.get_text(" ", strip=True)
@@ -1064,6 +1158,7 @@ class F95ZoneProvider:
             synopsis=synopsis,
             cover_url=cover_url,
             tags=tags,
+            screenshot_urls=screenshot_urls,
         )
 
 
@@ -1152,15 +1247,53 @@ class LewdCornerProvider:
             soup.select_one(".message-body .bbWrapper") or
             soup.select_one(".bbWrapper")
         )
+        # Scope image extraction to the first post only.
+        first_post_el = (
+            soup.select_one("article.message--first") or
+            soup.select_one(".message--first") or
+            body_el
+        )
+        first_post_html = str(first_post_el) if first_post_el else ""
+
         synopsis = cover_url = ""
         tags: list[str] = []
+        screenshot_urls: list[str] = []
+
+        # Images: LewdCorner also uses XenForo lazy-loading; extract attachment
+        # URLs directly from the first post's HTML.  Filter out /thumb/ copies.
+        _seen: set[str] = set()
+        _att_pat = re.compile(r'https://attachments\.lewdcorner\.com/[^\s"\'<>]+')
+        for u in _att_pat.findall(first_post_html):
+            if '/thumb/' in u or u in _seen:
+                continue
+            if any(x in u for x in ('smilies', 'emoji', '/awards/')):
+                continue
+            _seen.add(u)
+            if not cover_url:
+                cover_url = u
+            else:
+                screenshot_urls.append(u)
+            if len(screenshot_urls) >= 18:          # 1 cover + 18 = 19 total
+                break
+        # Fallback: external images via data-src in first post HTML
+        if not cover_url:
+            _ext_pat = re.compile(
+                r'data-src="(https://(?!attachments\.lewdcorner)[^\s"<>]+\.'
+                r'(?:jpg|jpeg|png|webp|gif)(?:\?[^\s"<>]*)?)"',
+                re.IGNORECASE,
+            )
+            for u in _ext_pat.findall(first_post_html):
+                if any(x in u for x in ('smilies', 'emoji')) or u in _seen:
+                    continue
+                _seen.add(u)
+                if not cover_url:
+                    cover_url = u
+                else:
+                    screenshot_urls.append(u)
+                if len(screenshot_urls) >= 18:
+                    break
 
         if body_el:
-            for img_el in body_el.select("img[src], img[data-src]"):
-                src = img_el.get("src") or img_el.get("data-src", "")
-                if src and src.startswith("http") and "smilies" not in src:
-                    cover_url = src
-                    break
             for el in body_el.select("p, div"):
                 t = el.get_text(" ", strip=True)
                 if len(t) > 80 and not t.startswith("["):
@@ -1222,6 +1355,7 @@ class LewdCornerProvider:
             synopsis=synopsis,
             cover_url=cover_url,
             tags=tags,
+            screenshot_urls=screenshot_urls,
         )
 
 
@@ -1310,6 +1444,19 @@ class ItchioProvider:
             if t and t not in tags:
                 tags.append(t)
 
+        # Screenshots: itch.io shows them in a .screenshot_list
+        screenshot_urls: list[str] = []
+        _seen: set[str] = {cover_url} if cover_url else set()
+        for img_el in soup.select(".screenshot_list img, .screenshots img"):
+            src = (img_el.get("data-src") or img_el.get("src", "")).strip()
+            # itch.io thumbnail URLs end in /original — swap to full res
+            src = re.sub(r"/\d+x\d+/", "/original/", src)
+            if src and src.startswith("http") and src not in _seen:
+                _seen.add(src)
+                screenshot_urls.append(src)
+            if len(screenshot_urls) >= 18:          # 1 cover + 18 = 19 total
+                break
+
         return MetadataCandidate(
             source=self.SOURCE,
             title=title,
@@ -1318,6 +1465,7 @@ class ItchioProvider:
             synopsis=synopsis,
             cover_url=cover_url,
             tags=tags,
+            screenshot_urls=screenshot_urls,
         )
 
 
@@ -1397,6 +1545,7 @@ class ThumbnailCache:
     def __init__(self, root: tk.Tk) -> None:
         self._root = root
         self._cache: dict[str, "ImageTk.PhotoImage"] = {}
+        self._pil_cache: dict[str, "Image.Image"] = {}   # for cross-fade blending
         self._pending: set[str] = set()
         self._work_q: queue.Queue = queue.Queue()
         self._done_q: queue.Queue = queue.Queue()
@@ -1410,7 +1559,7 @@ class ThumbnailCache:
                 on_ready) -> None:
         """Queue an async load. on_ready(key, photo) called on main thread."""
         if key in self._cache:
-            on_ready(key, self._cache[key])
+            on_ready(key, self._cache[key], self._pil_cache.get(key))
             return
         if key in self._pending:
             return
@@ -1419,6 +1568,9 @@ class ThumbnailCache:
 
     def get(self, key: str) -> "ImageTk.PhotoImage | None":
         return self._cache.get(key)
+
+    def get_pil(self, key: str) -> "Image.Image | None":
+        return self._pil_cache.get(key)
 
     def placeholder(self) -> "ImageTk.PhotoImage":
         if self._placeholder is None and HAS_PIL:
@@ -1455,9 +1607,10 @@ class ThumbnailCache:
                 if pil_img is not None and HAS_PIL:
                     photo = ImageTk.PhotoImage(pil_img)
                     self._cache[key] = photo
-                    cb(key, photo)
+                    self._pil_cache[key] = pil_img
+                    cb(key, photo, pil_img)
                 else:
-                    cb(key, self.placeholder())
+                    cb(key, self.placeholder(), None)
         except queue.Empty:
             pass
         self._root.after(60, self._drain)
@@ -1520,10 +1673,22 @@ def apply_theme(root: tk.Tk) -> None:
     style.map("TButton",
               background=[("active", ACCENT), ("pressed", ACCENT)],
               foreground=[("active", BG), ("pressed", BG)])
+    style.configure("TMenubutton",
+                    background=SEL, foreground=FG, padding=(8, 4), relief="flat",
+                    arrowsize=0, arrowcolor=SEL)
+    style.map("TMenubutton",
+              background=[("active", ACCENT), ("disabled", BG2)],
+              foreground=[("active", BG), ("disabled", FG_MUT)],
+              arrowcolor=[("active", ACCENT), ("disabled", BG2)])
     style.configure("Accent.TButton", background=ACCENT, foreground=BG)
     style.map("Accent.TButton",
               background=[("active", "#74c7ec")],
               foreground=[("active", BG)])
+    style.configure("Launch.TButton", background=ACCENT, foreground=BG,
+                    padding=(8, 10), font=("Segoe UI", 11, "bold"))
+    style.map("Launch.TButton",
+              background=[("active", "#74c7ec"), ("disabled", FG_MUT)],
+              foreground=[("active", BG), ("disabled", BG)])
     style.configure("Danger.TButton", background="#45475a", foreground=RED)
     style.map("Danger.TButton",
               background=[("active", RED)],
@@ -1627,7 +1792,7 @@ class ScrollableCardList(ttk.Frame):
         # Always reset scroll to top when the list is rebuilt
         self.canvas.yview_moveto(0.0)
 
-    def _on_thumb_ready(self, base_key: str, photo) -> None:
+    def _on_thumb_ready(self, base_key: str, photo, _pil=None) -> None:
         card = self._cards.get(base_key)
         if card and card.winfo_exists():
             card.set_thumbnail(photo)
@@ -1857,6 +2022,9 @@ class MetadataPickerDialog(tk.Toplevel):
         self._field_source: dict[str, str] = {f: "" for f in self._FIELDS}
         # Ordered list of available source keys for combo indexing
         self._combo_keys: list[str] = []
+        # All images from the cover_art source in user-defined order.
+        # _img_order[0] → cover,  [1:] → screenshots.
+        self._img_order: list[str] = []
 
         self._build()
         self.update_idletasks()
@@ -1993,6 +2161,49 @@ class MetadataPickerDialog(tk.Toplevel):
                                     state="disabled", relief="flat")
         self._preview_syn.pack(fill="x", padx=10, pady=(4, 0))
 
+        tk.Label(parent, bg=BG2, fg=FG_DIM, text="Tags:",
+                 font=("Segoe UI", 8), anchor="w").pack(anchor="w", padx=10, pady=(6, 2))
+        self._preview_tags = tk.Label(parent, bg=BG2, fg=FG,
+                                      font=("Segoe UI", 8),
+                                      wraplength=280, justify="left", anchor="w")
+        self._preview_tags.pack(anchor="w", padx=10)
+
+        # ── Image order list ──────────────────────────────────────────────────
+        ttk.Separator(parent, orient="horizontal").pack(
+            fill="x", padx=10, pady=(8, 4))
+        tk.Label(parent, bg=BG2, fg=FG_DIM,
+                 text="Images  (first = cover):",
+                 font=("Segoe UI", 8), anchor="w").pack(
+            anchor="w", padx=10, pady=(0, 2))
+
+        img_list_frame = tk.Frame(parent, bg=BG2)
+        img_list_frame.pack(fill="x", padx=10)
+        self._img_listbox = tk.Listbox(
+            img_list_frame, bg=BG3, fg=FG,
+            selectmode="single", height=6,
+            font=("Segoe UI", 8), activestyle="none",
+            selectbackground=SEL, selectforeground=FG,
+            exportselection=False, relief="flat", bd=0,
+        )
+        self._img_listbox.pack(side="left", fill="both", expand=True)
+        _img_sb = ttk.Scrollbar(img_list_frame, orient="vertical",
+                                 command=self._img_listbox.yview)
+        _img_sb.pack(side="left", fill="y")
+        self._img_listbox.configure(yscrollcommand=_img_sb.set)
+
+        img_btn_frame = tk.Frame(parent, bg=BG2)
+        img_btn_frame.pack(fill="x", padx=10, pady=(2, 6))
+        for _lbl, _cmd in [
+            ("▲ Up",     self._img_move_up),
+            ("▼ Down",   self._img_move_down),
+            ("★ Cover",  self._img_set_cover),
+            ("✕ Remove", self._img_remove),
+        ]:
+            tk.Button(img_btn_frame, bg=BG3, fg=FG,
+                      text=_lbl, font=("Segoe UI", 8),
+                      relief="flat", padx=4,
+                      command=_cmd).pack(side="left", padx=(0, 2))
+
     # ── Source column building ────────────────────────────────────────────────
 
     def _build_source_column(self, source: str,
@@ -2127,6 +2338,10 @@ class MetadataPickerDialog(tk.Toplevel):
                 if val:
                     self._field_source[f] = source
         self._sync_combos_to_state()
+        # If cover_art was just assigned and image list is empty, populate it
+        if not self._img_order and self._field_source.get("cover_art") == source:
+            self._img_order = self._build_img_order(cand)
+            self._populate_img_list()
         self._update_preview()
 
     def _refresh_field_combos(self) -> None:
@@ -2152,10 +2367,101 @@ class MetadataPickerDialog(tk.Toplevel):
         idx = combo.current()
         if idx <= 0:
             self._field_source[field] = ""
+            if field == "cover_art":
+                self._img_order = []
+                self._populate_img_list()
         else:
             key = self._combo_keys[idx - 1]
             self._field_source[field] = key
+            if field == "cover_art":
+                cand = self._selected_candidate.get(key)
+                self._img_order = self._build_img_order(cand)
+                self._populate_img_list()
         self._update_preview()
+
+    # ── Image list helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_img_order(cand: "MetadataCandidate | None") -> list[str]:
+        """Return [cover_url] + screenshot_urls from a candidate, deduped."""
+        if not cand:
+            return []
+        urls: list[str] = []
+        seen: set[str] = set()
+        for u in ([cand.cover_url] if cand.cover_url else []) + list(cand.screenshot_urls):
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+        return urls
+
+    def _populate_img_list(self) -> None:
+        """Rebuild the image listbox from self._img_order."""
+        self._img_listbox.delete(0, "end")
+        for i, url in enumerate(self._img_order):
+            name = url.rsplit("/", 1)[-1].split("?")[0][:50]
+            prefix = "★  " if i == 0 else f"   {i:2d}. "
+            self._img_listbox.insert("end", f"{prefix}{name}")
+        if self._img_order:
+            self._img_listbox.itemconfigure(0, fg=ACCENT)
+
+    def _img_move_up(self) -> None:
+        sel = self._img_listbox.curselection()
+        if not sel or sel[0] == 0:
+            return
+        i = sel[0]
+        self._img_order[i - 1], self._img_order[i] = (
+            self._img_order[i], self._img_order[i - 1])
+        self._populate_img_list()
+        self._img_listbox.selection_set(i - 1)
+        self._img_listbox.see(i - 1)
+        self._refresh_cover_from_order()
+
+    def _img_move_down(self) -> None:
+        sel = self._img_listbox.curselection()
+        if not sel or sel[0] >= len(self._img_order) - 1:
+            return
+        i = sel[0]
+        self._img_order[i], self._img_order[i + 1] = (
+            self._img_order[i + 1], self._img_order[i])
+        self._populate_img_list()
+        self._img_listbox.selection_set(i + 1)
+        self._img_listbox.see(i + 1)
+        self._refresh_cover_from_order()
+
+    def _img_set_cover(self) -> None:
+        sel = self._img_listbox.curselection()
+        if not sel or sel[0] == 0:
+            return
+        url = self._img_order.pop(sel[0])
+        self._img_order.insert(0, url)
+        self._populate_img_list()
+        self._img_listbox.selection_set(0)
+        self._img_listbox.see(0)
+        self._refresh_cover_from_order()
+
+    def _img_remove(self) -> None:
+        sel = self._img_listbox.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        self._img_order.pop(i)
+        self._populate_img_list()
+        new_sel = min(i, len(self._img_order) - 1)
+        if new_sel >= 0:
+            self._img_listbox.selection_set(new_sel)
+        self._refresh_cover_from_order()
+
+    def _refresh_cover_from_order(self) -> None:
+        """Reload the cover preview from the current first entry in _img_order."""
+        url = self._img_order[0] if self._img_order else ""
+        if url and url != self._preview_url and HAS_PIL and HAS_SCRAPING:
+            self._preview_url = url
+            threading.Thread(
+                target=self._fetch_preview_cover, args=(url,), daemon=True
+            ).start()
+        elif not url:
+            self._preview_url = ""
+            self._preview_cover.configure(image="", text="No cover")
 
     # ── Preview ───────────────────────────────────────────────────────────────
 
@@ -2163,6 +2469,7 @@ class MetadataPickerDialog(tk.Toplevel):
         """Refresh the right-hand preview from current _field_source selections."""
         title = dev = syn = ""
         cover_url = ""
+        tags: list[str] = []
 
         for f in self._FIELDS:
             src = self._field_source[f]
@@ -2176,7 +2483,10 @@ class MetadataPickerDialog(tk.Toplevel):
             elif f == "synopsis":
                 syn = cand.synopsis
             elif f == "cover_art":
-                cover_url = cand.cover_url
+                # Use the user's ordered list if populated; else fall back to candidate
+                cover_url = self._img_order[0] if self._img_order else cand.cover_url
+            elif f == "tags":
+                tags = cand.tags
 
         self._preview_title.configure(text=title)
         self._preview_dev.configure(text=dev)
@@ -2185,6 +2495,8 @@ class MetadataPickerDialog(tk.Toplevel):
         if syn:
             self._preview_syn.insert("1.0", syn)
         self._preview_syn.configure(state="disabled")
+        self._preview_tags.configure(
+            text=", ".join(tags) if tags else "(none)")
 
         if cover_url and cover_url != self._preview_url and HAS_PIL and HAS_SCRAPING:
             self._preview_url = cover_url
@@ -2199,7 +2511,7 @@ class MetadataPickerDialog(tk.Toplevel):
 
     def _fetch_preview_cover(self, url: str) -> None:
         try:
-            resp = _req.get(url, headers={"User-Agent": SCRAPER_UA},
+            resp = _req.get(url, impersonate="chrome131",
                             timeout=SCRAPER_TIMEOUT)
             resp.raise_for_status()
             from io import BytesIO
@@ -2265,6 +2577,7 @@ class MetadataPickerDialog(tk.Toplevel):
         field_sources: dict[str, str] = {}
         final: dict[str, object] = {}
         cover_url = ""
+        screenshot_urls: list[str] = []
 
         for f in self._FIELDS:
             src = self._field_source[f]
@@ -2279,7 +2592,12 @@ class MetadataPickerDialog(tk.Toplevel):
             elif f == "synopsis":
                 final["synopsis"] = cand.synopsis
             elif f == "cover_art":
-                cover_url = cand.cover_url
+                if self._img_order:
+                    cover_url      = self._img_order[0]
+                    screenshot_urls = list(self._img_order[1:])
+                else:
+                    cover_url       = cand.cover_url
+                    screenshot_urls = list(cand.screenshot_urls)
             elif f == "tags":
                 final["fetched_tags"] = cand.tags
 
@@ -2304,16 +2622,51 @@ class MetadataPickerDialog(tk.Toplevel):
         # Disable save button while working
         self._save_btn.configure(text="Saving…", state="disabled")
 
+        # Capture fetched tags now so the bg thread can pass them to the main thread
+        fetched_tags: list[str] = list(meta.get("fetched_tags", []))
+
+        n_shots = len(screenshot_urls)
+
         def _bg_save():
             if cover_url and HAS_SCRAPING:
+                self._app.after(0, lambda: self._save_btn.configure(
+                    text="Downloading cover…"))
                 _download_cover(cover_url, folder_path)
+                if n_shots:
+                    self._app.after(0, lambda: self._save_btn.configure(
+                        text=f"Downloading {n_shots} screenshots…"))
+                saved = _download_screenshots(screenshot_urls, folder_path)
+                meta["screenshot_files"] = saved          # local filenames
+                meta["screenshot_urls"]  = screenshot_urls  # original URLs
             save_game_metadata(folder_path, meta)
             self._version.metadata = meta
-            self._app.after(0, self._finish_save)
+            self._app.after(0, lambda: self._finish_save(fetched_tags))
 
         threading.Thread(target=_bg_save, daemon=True).start()
 
-    def _finish_save(self) -> None:
+    def _finish_save(self, fetched_tags: list[str]) -> None:
+        base_key = self._version.base_key
+
+        # Merge fetched tags into UserData.tags — ADD to existing, never wipe.
+        if fetched_tags:
+            ud = self._app.user_data
+            existing = ud.tags.get(base_key, [])
+            merged = list(existing)
+            for t in fetched_tags:
+                if t and t not in merged:
+                    merged.append(t)
+            if merged != existing:
+                ud.tags[base_key] = merged
+                save_userdata(self._app.user_data)
+
+        # Bust thumbnail cache for this game so the newly downloaded cover
+        # is loaded instead of the stale cached thumbnail.
+        tc = self._app.thumb_cache
+        for k in list(tc._cache):
+            if k == base_key or k.startswith(f"detail:{base_key}"):
+                tc._cache.pop(k, None)
+                tc._pil_cache.pop(k, None)
+
         self._app.refresh()
         if self.winfo_exists():
             self.destroy()
@@ -2681,22 +3034,96 @@ class DetailPanel(ttk.Frame):
         self._group: GameGroup | None = None
         self._version: GameVersion | None = None
         self._current_key: str | None = None   # for async art guard
-        self._detail_photo = None               # keep art PhotoImage alive
+        self._detail_photo = None               # keep PhotoImage alive
+        self._carousel_paths: list[Path] = []  # all images for current game
+        self._carousel_idx: int = 0            # currently shown index
+        self._slideshow_id: str | None = None  # after() handle for auto-advance
+        self._current_pil: "Image.Image | None" = None   # PIL image on screen for fade
+        self._fade_ids: list[str] = []                    # after() handles for fade frames
 
         self._build()
 
     def _build(self) -> None:
-        # ── Artwork ──────────────────────────────────────────────────────────
-        self._art_lbl = tk.Label(
-            self, bg=SEL, width=DETAIL_ART_W, height=DETAIL_ART_H,
-            text="", cursor="hand2")
-        self._art_lbl.pack(fill="x", padx=0, pady=0)
-        self._art_lbl.bind("<Button-1>", self._set_custom_art)
-        ttk.Label(self, text="Click artwork to set custom image",
-                  foreground=FG_MUT, font=("Segoe UI", 7),
-                  padding=(0, 1, 0, 4)).pack()
+        # ── Vertical pane: art section (resizable) | rest of detail ──────────
+        art_h = self._app._settings.get("detail_art_h", DETAIL_ART_H)
+        self._detail_pane = ttk.PanedWindow(self, orient="vertical")
+        self._detail_pane.pack(fill="both", expand=True)
 
-        inner = ttk.Frame(self)
+        # Top pane — artwork carousel
+        art_outer = tk.Frame(self._detail_pane, bg=BG)
+        self._detail_pane.add(art_outer, weight=0)
+
+        # Navigation bar packed FIRST so it always claims its space at the bottom
+        # before the image label expands — prevents nav from being pushed off-screen
+        nav = tk.Frame(art_outer, bg=BG)
+        nav.pack(side="bottom", fill="x")
+
+        self._car_prev = tk.Button(
+            nav, text="❮", bg=BG, fg=FG, relief="flat",
+            font=("Segoe UI", 9, "bold"), cursor="hand2", bd=0,
+            activebackground=BG2, activeforeground=ACCENT,
+            command=self._carousel_prev)
+        self._car_prev.pack(side="left", padx=(4, 0))
+
+        self._car_counter = tk.Label(
+            nav, bg=BG, fg=FG_DIM, font=("Segoe UI", 7), text="")
+        self._car_counter.pack(side="left", expand=True)
+
+        self._car_next = tk.Button(
+            nav, text="❯", bg=BG, fg=FG, relief="flat",
+            font=("Segoe UI", 9, "bold"), cursor="hand2", bd=0,
+            activebackground=BG2, activeforeground=ACCENT,
+            command=self._carousel_next)
+        self._car_next.pack(side="right", padx=(0, 4))
+
+        # ── Art label container — packed after nav so it fills remaining space
+        art_frame = tk.Frame(art_outer, bg=BG)
+        art_frame.pack(side="top", fill="both", expand=True)
+
+        self._art_lbl = tk.Label(
+            art_frame, bg=SEL,
+            text="", cursor="hand2")
+        self._art_lbl.pack(fill="both", expand=True)
+        # Left-click → fullscreen viewer; also grab focus for keyboard nav
+        self._art_lbl.bind("<Button-1>",
+                           lambda e: (self._art_lbl.focus_set(),
+                                      self._open_fullscreen(e)))
+        # Keyboard arrows when art label is focused
+        self._art_lbl.bind("<Left>",  lambda _: self._carousel_prev())
+        self._art_lbl.bind("<Right>", lambda _: self._carousel_next())
+        # Hover overlay — show/hide the change button
+        self._art_lbl.bind("<Enter>", self._on_art_enter)
+        self._art_lbl.bind("<Leave>", self._on_art_leave)
+
+        # ── Hover "✎ Change" button (placed over the art label via place())
+        self._change_btn = tk.Button(
+            art_frame,
+            text="✎ Change Image",
+            bg=BG3, fg=FG,
+            relief="flat", bd=0,
+            font=("Segoe UI", 8),
+            cursor="hand2",
+            activebackground=SEL, activeforeground=ACCENT,
+            command=self._set_custom_art)
+        # Bind hover on button itself so it doesn't flicker when cursor moves to it
+        self._change_btn.bind("<Enter>", self._on_art_enter)
+        self._change_btn.bind("<Leave>", self._on_art_leave)
+        # Button starts hidden; shown on <Enter>
+        self._change_btn_visible = False
+
+        # Apply saved height after window is drawn; persist on sash drag
+        self._detail_pane.bind(
+            "<Map>",
+            lambda e: self.after(60, lambda: self._apply_art_sash(art_h)))
+        self._detail_pane.bind(
+            "<ButtonRelease-1>",
+            lambda e: self._persist_art_sash())
+
+        # Bottom pane — everything else
+        inner_wrap = ttk.Frame(self._detail_pane)
+        self._detail_pane.add(inner_wrap, weight=1)
+
+        inner = ttk.Frame(inner_wrap)
         inner.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
         # ── Title + version selector ─────────────────────────────────────────
@@ -2749,34 +3176,47 @@ class DetailPanel(ttk.Frame):
         ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=4)
 
         # ── Actions ──────────────────────────────────────────────────────────
+        # ── Launch — full-width, prominent ───────────────────────────────────
+        self._btn_launch = ttk.Button(
+            inner, text="▶   Launch", style="Launch.TButton",
+            command=self._launch)
+        self._btn_launch.pack(fill="x", pady=(0, 6))
+
+        ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=(0, 6))
+
+        # ── Six utility buttons in 3×2 grid ──────────────────────────────────
         row1 = ttk.Frame(inner)
         row1.pack(fill="x", pady=(0, 4))
-        self._btn_launch = ttk.Button(
-            row1, text="▶  Launch", style="Accent.TButton",
-            command=self._launch)
-        self._btn_launch.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self._btn_open = ttk.Button(
             row1, text="Open Folder", command=self._open_folder)
-        self._btn_open.pack(side="left", expand=True, fill="x")
+        self._btn_open.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self._btn_played = ttk.Button(
+            row1, text="Mark Played", command=self._toggle_played)
+        self._btn_played.pack(side="left", expand=True, fill="x")
 
         row2 = ttk.Frame(inner)
         row2.pack(fill="x", pady=(0, 4))
-        self._btn_played = ttk.Button(
-            row2, text="Mark Played", command=self._toggle_played)
-        self._btn_played.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self._btn_saves = ttk.Button(
             row2, text="Open Saves", command=self._open_saves)
-        self._btn_saves.pack(side="left", expand=True, fill="x")
+        self._btn_saves.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self._btn_hide = ttk.Button(
+            row2, text="Hide Game", command=self._hide)
+        self._btn_hide.pack(side="left", expand=True, fill="x")
 
         row3 = ttk.Frame(inner)
         row3.pack(fill="x")
-        self._btn_hide = ttk.Button(
-            row3, text="Hide Game", command=self._hide)
-        self._btn_hide.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self._btn_del_arc = ttk.Button(
             row3, text="Delete Archive",
             style="Danger.TButton", command=self._delete_archive)
-        self._btn_del_arc.pack(side="left", expand=True, fill="x")
+        self._btn_del_arc.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self._download_menu = tk.Menu(row3, tearoff=False,
+                                      bg=BG2, fg=FG,
+                                      activebackground=SEL,
+                                      activeforeground=ACCENT, bd=0)
+        self._btn_download = ttk.Menubutton(
+            row3, text="↗ Download Page",
+            menu=self._download_menu, state="disabled")
+        self._btn_download.pack(side="left", expand=True, fill="x")
 
         # ── Metadata row ─────────────────────────────────────────────────────
         ttk.Separator(inner, orient="horizontal").pack(fill="x", pady=(8, 4))
@@ -2847,13 +3287,21 @@ class DetailPanel(ttk.Frame):
         self._refresh_metadata_display()
 
     def show_empty(self) -> None:
+        self._slideshow_cancel()
+        self._fade_cancel()
+        self._current_pil = None
         self._group = None
         self._version = None
-        self._current_key = None
+        self._current_key    = None
+        self._carousel_paths = []
+        self._carousel_idx   = 0
         self._title_lbl.configure(text="Select a game")
         self._set_enabled(False)
         self._art_lbl.configure(image="", text="", bg=SEL)
         self._detail_photo = None
+        self._car_counter.configure(text="")
+        self._car_prev.configure(state="disabled")
+        self._car_next.configure(state="disabled")
 
     # ── Internals ────────────────────────────────────────────────────────────
 
@@ -2914,29 +3362,168 @@ class DetailPanel(ttk.Frame):
                   tc: ThumbnailCache) -> None:
         if not HAS_PIL:
             return
-        art = _group_art_path(g, ud)
-        if not art:
-            placeholder = tc.detail_placeholder()
+        # Build carousel path list; reset to first image
+        self._fade_cancel()
+        self._current_pil    = None   # don't carry over prev game's image
+        self._carousel_paths = _group_carousel_paths(g, ud)
+        self._carousel_idx   = 0
+        self._tc             = tc   # keep reference for navigation
+        self._carousel_show(g.base_key)
+        self._slideshow_start()
+        # Warm the PIL cache for all remaining images so cross-fades are smooth
+        # on the very first cycle. Short delay lets layout settle so winfo_* is valid.
+        self.after(200, self._preload_carousel)
+
+    def _preload_carousel(self) -> None:
+        """Fire background loads for every carousel image that isn't cached yet."""
+        if not self._carousel_paths or not HAS_PIL or not hasattr(self, "_tc"):
+            return
+        w = max(self._art_lbl.winfo_width(),  DETAIL_ART_W)
+        h = max(self._art_lbl.winfo_height(), DETAIL_ART_H)
+        for idx, path in enumerate(self._carousel_paths):
+            key = f"detail:{self._current_key}:{idx}"
+            self._tc.request(key, path, w, h, on_ready=lambda *_: None)
+
+    def _carousel_show(self, base_key: str | None = None) -> None:
+        """Load and display the image at _carousel_idx."""
+        paths = self._carousel_paths
+        total = len(paths)
+        if not HAS_PIL or not total:
+            placeholder = getattr(self, "_tc", None) and self._tc.detail_placeholder()
             if placeholder:
                 self._art_lbl.configure(image=placeholder, text="")
                 self._detail_photo = placeholder
+            else:
+                self._art_lbl.configure(image="", text="No artwork",
+                                        bg=SEL, fg=FG_DIM)
+            self._car_counter.configure(text="")
+            self._car_prev.configure(fg=FG_MUT)
+            self._car_next.configure(fg=FG_MUT)
             return
+
+        idx  = self._carousel_idx
+        path = paths[idx]
+        key  = f"detail:{self._current_key}:{idx}"
+
+        self._fade_cancel()
         self._art_lbl.configure(text="Loading…", image="")
         self._detail_photo = None
-        key = f"detail:{g.base_key}"
-        tc.request(key, art, DETAIL_ART_W, DETAIL_ART_H,
-                   on_ready=self._on_art_ready)
+        self._car_counter.configure(text=f"{idx + 1} / {total}")
+        # Arrows always visible; dim when at the boundary but keep clickable
+        self._car_prev.configure(fg=FG     if idx > 0        else FG_MUT)
+        self._car_next.configure(fg=FG     if idx < total - 1 else FG_MUT)
 
-    def _on_art_ready(self, key: str, photo) -> None:
-        expected = f"detail:{self._current_key}"
+        w = max(self._art_lbl.winfo_width(),  DETAIL_ART_W)
+        h = max(self._art_lbl.winfo_height(), DETAIL_ART_H)
+        self._tc.request(key, path, w, h, on_ready=self._on_art_ready)
+
+    def _carousel_prev(self) -> None:
+        total = len(self._carousel_paths)
+        if total:
+            self._carousel_idx = (self._carousel_idx - 1) % total
+            self._carousel_show()
+            self._slideshow_start()   # reset timer after manual nav
+
+    def _carousel_next(self) -> None:
+        total = len(self._carousel_paths)
+        if total:
+            self._carousel_idx = (self._carousel_idx + 1) % total
+            self._carousel_show()
+            self._slideshow_start()   # reset timer after manual nav
+
+    # ── Slideshow auto-advance ────────────────────────────────────────────────
+
+    def _slideshow_start(self) -> None:
+        """Schedule the next auto-advance tick. Reads interval from settings."""
+        self._slideshow_cancel()
+        if len(self._carousel_paths) < 2:
+            return
+        interval_s = self._app._settings.get("slideshow_interval", 3.5)
+        ms = max(500, int(float(interval_s) * 1000))
+        self._slideshow_id = self.after(ms, self._slideshow_tick)
+
+    def _slideshow_cancel(self) -> None:
+        if self._slideshow_id is not None:
+            try:
+                self.after_cancel(self._slideshow_id)
+            except Exception:
+                pass
+            self._slideshow_id = None
+
+    def _slideshow_tick(self) -> None:
+        self._slideshow_id = None
+        if not self._carousel_paths:
+            return
+        self._carousel_idx = (self._carousel_idx + 1) % len(self._carousel_paths)
+        self._carousel_show()
+        self._slideshow_start()
+
+    def _on_art_ready(self, key: str, photo, pil_img=None) -> None:
+        # Guard: key must match current game + current carousel index
+        expected = f"detail:{self._current_key}:{self._carousel_idx}"
         if key != expected:
-            return  # user navigated away
-        self._detail_photo = photo
-        if photo:
-            self._art_lbl.configure(image=photo, text="")
-        else:
+            return
+        if not photo:
             self._art_lbl.configure(image="", text="No artwork",
                                     bg=SEL, fg=FG_DIM)
+            self._current_pil = None
+            return
+        old_pil = self._current_pil
+        if HAS_PIL and old_pil is not None and pil_img is not None:
+            self._fade_transition(old_pil, pil_img, photo)
+        else:
+            # No previous image or no PIL — show immediately
+            self._detail_photo = photo
+            self._art_lbl.configure(image=photo, text="")
+            self._current_pil = pil_img
+
+    # ── Cross-fade transition ─────────────────────────────────────────────────
+
+    def _fade_cancel(self) -> None:
+        """Cancel any in-progress cross-fade."""
+        for fid in self._fade_ids:
+            try:
+                self.after_cancel(fid)
+            except Exception:
+                pass
+        self._fade_ids.clear()
+
+    def _fade_transition(self, old_pil: "Image.Image", new_pil: "Image.Image",
+                         new_photo: "ImageTk.PhotoImage",
+                         frames: int = 8, step_ms: int = 25) -> None:
+        """Cross-fade from old_pil → new_pil over frames×step_ms ms."""
+        self._fade_cancel()
+
+        # Ensure both images are the same size for blending
+        target_size = new_pil.size
+        if old_pil.size != target_size:
+            old_pil = old_pil.resize(target_size, Image.LANCZOS)
+
+        # Convert both to RGBA for clean blending
+        old_rgba = old_pil.convert("RGBA")
+        new_rgba = new_pil.convert("RGBA")
+
+        # Pre-build all intermediate PhotoImages so the main loop stays light
+        blend_photos: list["ImageTk.PhotoImage"] = []
+        for i in range(1, frames + 1):
+            alpha = i / frames
+            blended = Image.blend(old_rgba, new_rgba, alpha)
+            blend_photos.append(ImageTk.PhotoImage(blended))
+
+        def _apply_frame(idx: int) -> None:
+            if idx >= len(blend_photos):
+                # Final frame: commit new_photo and PIL image
+                self._detail_photo = new_photo
+                self._art_lbl.configure(image=new_photo, text="")
+                self._current_pil = new_pil
+                self._fade_ids.clear()
+                return
+            self._detail_photo = blend_photos[idx]
+            self._art_lbl.configure(image=blend_photos[idx], text="")
+            fid = self.after(step_ms, lambda i=idx + 1: _apply_frame(i))
+            self._fade_ids.append(fid)
+
+        _apply_frame(0)
 
     def _set_enabled(self, en: bool) -> None:
         s = "normal" if en else "disabled"
@@ -2945,11 +3532,54 @@ class DetailPanel(ttk.Frame):
             b.configure(state=s)
         if HAS_SCRAPING:
             self._btn_fetch_meta.configure(state=s)
+        if not en:
+            self._btn_download.configure(state="disabled")
+
+    # Sources excluded from the download menu (info-only, not download hosts)
+    _DOWNLOAD_EXCLUDE = {"vndb"}
+
+    def _refresh_download_menu(self) -> None:
+        """Rebuild the Download Page menubutton from stored metadata sources."""
+        self._download_menu.delete(0, "end")
+        if not self._app.net_ok("allow_download_links"):
+            self._btn_download.configure(state="disabled")
+            return
+        v = self._version
+        if not v or not v.metadata:
+            self._btn_download.configure(state="disabled")
+            return
+        sources = v.metadata.get("sources", {})
+        entries = [
+            (src, data["url"])
+            for src, data in sources.items()
+            if src not in self._DOWNLOAD_EXCLUDE and data.get("url")
+        ]
+        if not entries:
+            self._btn_download.configure(state="disabled")
+            return
+        if len(entries) == 1:
+            # Single source — skip the menu, open directly on click
+            url = entries[0][1]
+            self._btn_download.configure(
+                state="normal",
+                command=lambda u=url: webbrowser.open(u))
+            # Menubutton doesn't natively support command= in ttk; wrap via menu
+            self._download_menu.add_command(
+                label=SOURCE_LABELS.get(entries[0][0], entries[0][0]),
+                command=lambda u=url: webbrowser.open(u))
+        else:
+            for src, url in entries:
+                label = SOURCE_LABELS.get(src, src)
+                self._download_menu.add_command(
+                    label=label,
+                    command=lambda u=url: webbrowser.open(u))
+        self._btn_download.configure(state="normal")
 
     # ── Metadata ─────────────────────────────────────────────────────────────
 
     def _refresh_metadata_display(self) -> None:
         """Show synopsis and source line if metadata present for this version."""
+        self._refresh_download_menu()
         v = self._version
         if not v or not v.metadata:
             self._meta_source_lbl.configure(text="")
@@ -3214,24 +3844,172 @@ class DetailPanel(ttk.Frame):
             ud.notes.pop(g.base_key, None)
         save_userdata(ud)
 
+    # ── Art sash persistence ──────────────────────────────────────────────────
+
+    def _apply_art_sash(self, h: int) -> None:
+        try:
+            self._detail_pane.update_idletasks()
+            total = self._detail_pane.winfo_height()
+            if total > h + 60:
+                self._detail_pane.sashpos(0, h)
+        except Exception:
+            pass
+
+    def _persist_art_sash(self) -> None:
+        try:
+            pos = self._detail_pane.sashpos(0)
+            if pos > 0:
+                self._app._settings["detail_art_h"] = pos
+                save_settings(self._app._settings)
+        except Exception:
+            pass
+
+    # ── Hover overlay ─────────────────────────────────────────────────────────
+
+    def _on_art_enter(self, _e=None) -> None:
+        if not self._change_btn_visible and self._group:
+            self._change_btn_visible = True
+            self._change_btn.place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-4)
+            self._change_btn.lift()
+
+    def _on_art_leave(self, _e=None) -> None:
+        # Check pointer is truly outside the art+button area before hiding
+        try:
+            px, py = self._art_lbl.winfo_pointerxy()
+            wx  = self._art_lbl.winfo_rootx()
+            wy  = self._art_lbl.winfo_rooty()
+            ww  = self._art_lbl.winfo_width()
+            wh  = self._art_lbl.winfo_height()
+            if wx <= px <= wx + ww and wy <= py <= wy + wh:
+                return
+            bx  = self._change_btn.winfo_rootx()
+            by  = self._change_btn.winfo_rooty()
+            bw  = self._change_btn.winfo_width()
+            bh  = self._change_btn.winfo_height()
+            if bx <= px <= bx + bw and by <= py <= by + bh:
+                return
+        except Exception:
+            pass
+        self._change_btn_visible = False
+        self._change_btn.place_forget()
+
+    # ── Fullscreen viewer ─────────────────────────────────────────────────────
+
+    def _open_fullscreen(self, _e=None) -> None:
+        if not self._carousel_paths or not HAS_PIL:
+            return
+
+        sw = self._app.winfo_screenwidth()
+        sh = self._app.winfo_screenheight()
+        max_w, max_h = sw - 80, sh - 120
+
+        # Mutable index shared across closures
+        state = {"idx": self._carousel_idx}
+
+        win = tk.Toplevel(self._app)
+        win.configure(bg=BG3)
+        win.grab_set()
+        win.focus_set()
+
+        # Image label
+        img_lbl = tk.Label(win, bg=BG3, cursor="hand2")
+        img_lbl.pack(fill="both", expand=True, padx=20, pady=(20, 8))
+        img_lbl.bind("<Button-1>", lambda _: win.destroy())
+
+        # Nav bar
+        nav = tk.Frame(win, bg=BG3)
+        nav.pack(fill="x", pady=(0, 12))
+
+        def _load(idx: int) -> None:
+            paths = self._carousel_paths
+            total = len(paths)
+            if not total:
+                return
+            state["idx"] = idx % total
+            i = state["idx"]
+            try:
+                raw = Image.open(paths[i]).convert("RGB")
+            except Exception:
+                img_lbl.configure(image="", text="Could not load image", fg=FG_DIM)
+                return
+            raw.thumbnail((max_w, max_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(raw)
+            img_lbl.configure(image=photo, text="")
+            img_lbl.image = photo  # type: ignore[attr-defined]
+            counter.configure(text=f"{i + 1} / {total}")
+            prev_btn.configure(fg=FG if total > 1 else FG_MUT)
+            next_btn.configure(fg=FG if total > 1 else FG_MUT)
+            win.title(paths[i].name)
+            # Re-centre after first load
+            win.update_idletasks()
+            x = (sw - win.winfo_width())  // 2
+            y = (sh - win.winfo_height()) // 2
+            win.geometry(f"+{x}+{y}")
+
+        prev_btn = tk.Button(
+            nav, text="❮", bg=BG3, fg=FG, relief="flat",
+            font=("Segoe UI", 14, "bold"), cursor="hand2", bd=0,
+            activebackground=BG3, activeforeground=ACCENT,
+            command=lambda: _load(state["idx"] - 1))
+        prev_btn.pack(side="left", padx=(20, 0))
+
+        counter = tk.Label(nav, bg=BG3, fg=FG_DIM, font=("Segoe UI", 9), text="")
+        counter.pack(side="left", expand=True)
+
+        next_btn = tk.Button(
+            nav, text="❯", bg=BG3, fg=FG, relief="flat",
+            font=("Segoe UI", 14, "bold"), cursor="hand2", bd=0,
+            activebackground=BG3, activeforeground=ACCENT,
+            command=lambda: _load(state["idx"] + 1))
+        next_btn.pack(side="right", padx=(0, 20))
+
+        win.bind("<Left>",  lambda _: _load(state["idx"] - 1))
+        win.bind("<Right>", lambda _: _load(state["idx"] + 1))
+        win.bind("<Escape>", lambda _: win.destroy())
+
+        _load(state["idx"])
+
+    # ── Image management ──────────────────────────────────────────────────────
+
     def _set_custom_art(self, _e=None) -> None:
         g = self._group
         if not g:
             return
-        path = filedialog.askopenfilename(
-            title="Select cover image",
+        paths = filedialog.askopenfilenames(
+            title="Select image(s)  —  first selected becomes the cover",
             filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"),
                        ("All files", "*.*")])
-        if not path:
+        if not paths:
             return
-        ud = self._app.user_data
-        ud.custom_art[g.base_key] = path
+
+        ud  = self._app.user_data
+        tc  = self._app.thumb_cache
+
+        # First file → cover
+        cover_path = paths[0]
+        ud.custom_art[g.base_key] = cover_path
         save_userdata(ud)
-        # Reload artwork
-        # Bust cache for this key
-        tc = self._app.thumb_cache
-        tc._cache.pop(g.base_key, None)
-        tc._cache.pop(f"detail:{g.base_key}", None)
+
+        # Additional files → save as screenshots in .vnpf/ of the latest version
+        if len(paths) > 1 and g.versions:
+            vnpf = _vnpf_dir(g.versions[-1].folder_path)
+            vnpf.mkdir(parents=True, exist_ok=True)
+            # Find next free screenshot index
+            existing = sorted(vnpf.glob("screenshot_*.*"), key=lambda p: p.stem)
+            next_idx = len(existing) + 1
+            for extra in paths[1:]:
+                src = Path(extra)
+                dest = vnpf / f"screenshot_{next_idx:03d}{src.suffix.lower()}"
+                try:
+                    shutil.copy2(src, dest)
+                    next_idx += 1
+                except OSError:
+                    pass
+
+        # Bust cache and reload
+        for k in list(tc._cache):
+            if k == g.base_key or k.startswith(f"detail:{g.base_key}"):
+                tc._cache.pop(k, None)
         self._load_art(g, ud, tc)
         art = _group_art_path(g, ud)
         if art:
@@ -5035,6 +5813,26 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(dir_row, text="Apply",
                    command=self._apply_lib_dir).pack(side="left", padx=(4, 0))
 
+        # Slideshow interval
+        slide_row = tk.Frame(self, bg=BG)
+        slide_row.pack(fill="x", padx=20, pady=(4, 10))
+        tk.Label(slide_row, text="Slideshow interval", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._slide_val_lbl = tk.Label(slide_row, bg=BG, fg=ACCENT,
+                                       font=("Segoe UI", 9, "bold"), width=5)
+        self._slide_val_lbl.pack(side="right")
+        tk.Label(slide_row, text="s", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 9)).pack(side="right")
+        saved_interval = float(s.get("slideshow_interval", 3.5))
+        # Store as int*10 internally (5 = 0.5s, 300 = 30s) for Scale resolution
+        self._slide_var = tk.IntVar(value=int(round(saved_interval * 10)))
+        slide_scale = ttk.Scale(
+            slide_row, from_=5, to=300,
+            orient="horizontal", variable=self._slide_var,
+            command=self._on_slide_change)
+        slide_scale.pack(side="right", fill="x", expand=True, padx=(10, 6))
+        self._on_slide_change()   # set initial label
+
         # ── Connection section ────────────────────────────────────────────────
         ttk.Separator(self, orient="horizontal").pack(fill="x", pady=(4, 0))
         hdr2 = tk.Frame(self, bg=BG2)
@@ -5075,6 +5873,7 @@ class SettingsDialog(tk.Toplevel):
             ("check_updates",        "App update checks"),
             ("fetch_metadata",       "Metadata fetch  (VNDB, F95Zone, LewdCorner)"),
             ("allow_provider_login", "Provider logins  (site cookies / webview)"),
+            ("allow_download_links", "Download page links  (↗ Download Page button)"),
         ]
         tgl_frame = tk.Frame(self, bg=BG)
         tgl_frame.pack(fill="x", padx=36, pady=(0, 14))
@@ -5111,6 +5910,15 @@ class SettingsDialog(tk.Toplevel):
                    command=self.destroy).pack(pady=(4, 10))
 
     # ── General handlers ──────────────────────────────────────────────────────
+
+    def _on_slide_change(self, _=None) -> None:
+        val = self._slide_var.get()
+        seconds = val / 10.0
+        # Display as integer if whole number, else one decimal place
+        display = f"{int(seconds)}" if seconds == int(seconds) else f"{seconds:.1f}"
+        self._slide_val_lbl.configure(text=display)
+        self.app._settings["slideshow_interval"] = seconds
+        save_settings(self.app._settings)
 
     def _browse_lib(self) -> None:
         d = filedialog.askdirectory(
@@ -5207,6 +6015,7 @@ class LibraryApp(tk.Tk):
         self._show_hidden: bool = False
         self._filter_status: str = "All"    # All / Played / Unplayed
         self._filter_tags: set[str] = set()
+        self._filter_tags_mode: str = "any"  # "any" (OR) or "all" (AND)
         self._queue_window: ExtractionQueueWindow | None = None
 
         self._build_ui()
@@ -5248,14 +6057,23 @@ class LibraryApp(tk.Tk):
         sort_cb.pack(side="right", padx=2)
         sort_cb.bind("<<ComboboxSelected>>", lambda _: self._apply_filters())
 
-        # Tag filter
-        self._tag_btn = ttk.Menubutton(tb, text="Tags ▾")
+        # Tag filter — [Tags ▾] [✕] as a unit
+        _tag_frame = tk.Frame(tb, bg=BG)
+        _tag_frame.pack(side="right", padx=(16, 0))
+        self._tag_btn = ttk.Menubutton(_tag_frame, text="Tags ▾")
         self._tag_menu = tk.Menu(self._tag_btn, tearoff=False,
                                   bg=BG2, fg=FG, activebackground=SEL,
                                   activeforeground=ACCENT, bd=0)
         self._tag_btn.configure(menu=self._tag_menu)
-        self._tag_btn.pack(side="right", padx=(16, 2))
+        self._tag_btn.pack(side="left")
+        self._tag_clear_btn = tk.Button(
+            _tag_frame, text="✕", bg=BG, fg=FG_MUT,
+            relief="flat", font=("Segoe UI", 8, "bold"),
+            cursor="hand2", bd=0, padx=4,
+            command=self._clear_tags)
+        self._tag_clear_btn.pack(side="left", padx=(2, 0))
         self._tag_vars: dict[str, tk.BooleanVar] = {}
+        self._tag_mode_var = tk.StringVar(value="any")
 
         # Search
         ttk.Label(tb, text="Search:").pack(side="right", padx=(16, 2))
@@ -5400,11 +6218,16 @@ class LibraryApp(tk.Tk):
                     continue
                 if self._filter_status == "Unplayed" and any_played:
                     continue
-            # Tags (OR — game must have at least one selected tag)
+            # Tags — AND mode: game must have every selected tag
+            #         OR mode: game must have at least one selected tag
             if self._filter_tags:
                 game_tags = set(ud.tags.get(g.base_key, []))
-                if not (self._filter_tags & game_tags):
-                    continue
+                if self._filter_tags_mode == "all":
+                    if not self._filter_tags.issubset(game_tags):
+                        continue
+                else:
+                    if not (self._filter_tags & game_tags):
+                        continue
             filtered.append(g)
 
         # Sort
@@ -5445,30 +6268,65 @@ class LibraryApp(tk.Tk):
             all_tags.update(tag_list)
 
         self._tag_menu.delete(0, "end")
+
+        # Match-mode toggle at the top
+        self._tag_menu.add_radiobutton(
+            label="Match: Any tag  (OR)",
+            variable=self._tag_mode_var, value="any",
+            command=self._on_tag_mode_change,
+            foreground=FG, background=BG2,
+            activeforeground=ACCENT, activebackground=SEL)
+        self._tag_menu.add_radiobutton(
+            label="Match: All tags  (AND)",
+            variable=self._tag_mode_var, value="all",
+            command=self._on_tag_mode_change,
+            foreground=FG, background=BG2,
+            activeforeground=ACCENT, activebackground=SEL)
+        if all_tags:
+            self._tag_menu.add_separator()
+
         self._tag_vars.clear()
         for tag in sorted(all_tags):
             var = tk.BooleanVar(value=tag in self._filter_tags)
             self._tag_vars[tag] = var
             self._tag_menu.add_checkbutton(
                 label=tag, variable=var,
-                command=self._on_tag_toggle)
+                command=self._on_tag_toggle,
+                foreground=FG, background=BG2,
+                activeforeground=ACCENT, activebackground=SEL)
         if all_tags:
             self._tag_menu.add_separator()
-            self._tag_menu.add_command(label="Clear all tags",
-                                        command=self._clear_tags)
+            self._tag_menu.add_command(
+                label="✕  Clear all tags",
+                command=self._clear_tags,
+                foreground=FG_MUT, background=BG2,
+                activeforeground=FG, activebackground=SEL)
 
     def _on_tag_toggle(self) -> None:
         self._filter_tags = {t for t, v in self._tag_vars.items() if v.get()}
-        n = len(self._filter_tags)
-        self._tag_btn.configure(
-            text=f"Tags ({n}) ▾" if n else "Tags ▾")
+        self._update_tag_btn_label()
         self._apply_filters()
+
+    def _on_tag_mode_change(self) -> None:
+        self._filter_tags_mode = self._tag_mode_var.get()
+        self._update_tag_btn_label()
+        self._apply_filters()
+
+    def _update_tag_btn_label(self) -> None:
+        n = len(self._filter_tags)
+        if n:
+            mode = "ALL" if self._filter_tags_mode == "all" else "ANY"
+            self._tag_btn.configure(text=f"Tags ({n} {mode}) ▾")
+            self._tag_clear_btn.configure(fg=ACCENT)
+        else:
+            self._tag_btn.configure(text="Tags ▾")
+            self._tag_clear_btn.configure(fg=FG_MUT)
 
     def _clear_tags(self) -> None:
         for v in self._tag_vars.values():
             v.set(False)
         self._filter_tags.clear()
-        self._tag_btn.configure(text="Tags ▾")
+        self._update_tag_btn_label()
         self._apply_filters()
 
     # ── Selection ─────────────────────────────────────────────────────────────

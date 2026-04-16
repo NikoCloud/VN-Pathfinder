@@ -29,20 +29,30 @@ Everything runs locally. No accounts. No telemetry. **Zero network access by def
 - **Multi-version grouping** — multiple versions of the same game are grouped under one entry
 - **Custom display names** and **notes** per game
 - **Tag system** with colour-coded chips, built-in genre/status presets, user-promoted custom presets, and a bulk preset manager
-- **Search, sort, and filter** by name, played status, and tags
+- **Search, sort, and filter** by name, played status, and tags (AND / OR mode)
+
+### Detail Panel
+- **Screenshot carousel** — browse all artwork scraped from the source thread; auto-advances with a configurable slideshow timer
+- **Cross-fade transitions** between carousel images
+- **Click to fullscreen** — view any image at full resolution; navigate with arrow keys or ← ❮ ❯ → buttons
+- **Resizable art area** — drag the sash to give more or less space to artwork
+- **Hover overlay** — "Change Image" button appears on hover; supports multi-file select (first = cover, rest added as screenshots)
+- **↗ Download Page** button — opens the game's source page (F95Zone, LewdCorner, itch.io) in your browser; shows a dropdown when multiple sources are saved
 
 ### Metadata Scraping *(opt-in)*
-Fetch rich game information — title, developer, synopsis, cover art, and tags — from multiple sources and pick the best data field by field.
+Fetch rich game information — title, developer, synopsis, cover art, screenshot gallery, and tags — from multiple sources and pick the best data field by field.
 
 | Source | Login required | What it provides |
 |--------|---------------|-----------------|
 | **VNDB** | No | Title, developer, synopsis, cover art, tags |
-| **F95Zone** | Username + password | Title, developer, synopsis, cover art, tags |
-| **LewdCorner** | Username + password | Title, developer, synopsis, cover art, tags |
-| **itch.io** | In-app browser | Title, developer, synopsis, cover art |
+| **F95Zone** | Username + password | Title, developer, synopsis, cover art, up to 19 screenshots, tags |
+| **LewdCorner** | Username + password | Title, developer, synopsis, cover art, up to 19 screenshots, tags |
+| **itch.io** | In-app browser | Title, developer, synopsis, cover art, screenshots |
 
 - **Per-field source picker** — choose which site provides each individual field
-- **Cover art** downloaded and stored locally in `.vnpf/` per game — no repeated network calls
+- **Image manager in picker** — see every scraped image in a numbered list; promote any image to cover with ★ Cover, reorder with ▲ ▼, or remove unwanted images before saving
+- **Images scoped to the game's first post** — never pulls in reply images, signatures, or avatars
+- **Cover art and screenshots** downloaded in parallel and stored locally in `.vnpf/` — no repeated network calls
 - **itch.io browser login** uses an embedded Chromium window so Cloudflare is handled automatically — no copying cookies or opening DevTools
 
 ### Archive Management
@@ -60,14 +70,15 @@ Fetch rich game information — title, developer, synopsis, cover art, and tags 
 ### Settings
 - **Configurable library directory** — point the app at any folder, hot-reloads immediately without a restart
 - **LOCKDOWN MODE** — master kill-switch for all network access, **on by default**. One toggle to unlock everything; one toggle to go offline again.
-- Per-feature toggles for update checks, metadata scraping, and site logins
+- Per-feature toggles for update checks, metadata scraping, site logins, and download page links
+- **Slideshow interval** slider (0.5 – 30 seconds) for the detail panel carousel
 - Lockdown indicator in the status bar — click it to open Settings
 
 ---
 
 ## Screenshots
 
-> Screenshots will be added before v1.0.0 stable release.
+> Screenshots coming soon.
 
 ---
 
@@ -114,6 +125,8 @@ Open Settings (⚙ button, top toolbar) → **General** → set your game librar
 | Rename a game | Detail panel → edit the display name field |
 | Add notes | Detail panel → Notes text box (auto-saves on focus loss) |
 | Hide a game | Detail panel → **Hide** |
+| Filter by tags | Toolbar → **Tags ▾** — select one or more; toggle AND / OR mode |
+| Clear tag filter | Toolbar → **✕** button next to Tags (lights up when active) |
 
 ### Metadata fetching
 
@@ -121,11 +134,23 @@ Open Settings (⚙ button, top toolbar) → **General** → set your game librar
 2. Edit the search query if needed, choose which sources to search, click **Search**
 3. In the picker, select the best result from each source using the radio buttons
 4. On the right panel, use the dropdowns to choose which source provides each field
-5. Click **Save** — cover art is downloaded and stored locally
+5. In the **Images** list, reorder images or promote a different one to cover with **★ Cover**
+6. Click **Save** — cover and screenshots are downloaded and stored locally
 
 **Site logins** are managed via the login dialog inside the fetch screen, or directly from **⚙ Settings**:
 - **F95Zone / LewdCorner** — enter username and password; a session token is saved locally, your password is never stored
 - **itch.io** — click *Log in with browser*, log in normally in the window that opens, it closes automatically when done
+
+### Detail panel artwork
+
+| Action | How |
+|--------|-----|
+| Browse screenshots | ❮ / ❯ buttons, or Left / Right arrow keys |
+| View fullscreen | Click the image |
+| Navigate fullscreen | Arrow keys or ❮ / ❯ buttons |
+| Change cover / add screenshots | Hover over image → **Change Image** button |
+| Resize art area | Drag the sash between image and info |
+| Adjust slideshow speed | **⚙ Settings → General → Slideshow interval** |
 
 ### Archives tab
 
@@ -141,10 +166,12 @@ Open Settings (⚙ button, top toolbar) → **General** → set your game librar
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | Game library directory | *(set on first launch)* | Folder to scan for games |
+| Slideshow interval | 3.5 s | Time between auto-advance ticks in the detail carousel |
 | LOCKDOWN MODE | **On** | Master kill-switch — disables all network access |
 | App update checks | On | Check GitHub for new releases on startup |
 | Metadata fetch | On | Allow VNDB / F95Zone / LewdCorner / itch.io scraping |
 | Provider logins | On | Allow site login dialogs |
+| Download page links | On | Enable the ↗ Download Page button |
 
 ---
 
@@ -175,8 +202,7 @@ Releases are built automatically by GitHub Actions on every version tag push.
 ## Roadmap
 
 - [ ] Screenshots in README
-- [ ] UI redesign (v2.0)
-- [ ] Import/export library data
+- [ ] Export library to CSV / JSON
 - [ ] Bulk tag assignment
 - [ ] Series / franchise grouping
 
