@@ -94,7 +94,29 @@ Fetch rich game information — title, developer, synopsis, cover art, screensho
 
 ## Screenshots
 
-> Screenshots coming soon.
+### Library & Detail Panel
+![Library view showing game list with cover art, tags, and detail panel](assets/Hero_Banner.png)
+*Game list with cover art, colour-coded tags, synopsis, and action buttons — all in one view.*
+
+### Fullscreen Artwork Viewer
+![Fullscreen image viewer with thumbnail strip](assets/Artwork_Fullscreen.png)
+*Click any image in the carousel to go fullscreen. Navigate with arrow keys or on-screen buttons.*
+
+### Metadata Fetch — Source Selection
+![Fetch dialog with source selector open](assets/Fetch_Sources.png)
+*Choose which sources to pull metadata from — F95Zone, LewdCorner, itch.io, and more.*
+
+### Metadata Fetch — Results & Field Picker
+![Fetch results with per-field source picker and preview](assets/Fetch_results.png)
+*Pick the best result field by field. Preview cover art and screenshots before saving.*
+
+### Archive & Patch Management
+![Archives tab with file list, type column, modified date, and action buttons](assets/Archive_Screen.png)
+*All ZIPs, RARs, and patch files in your library root — with size, type, last-modified date, and one-click extraction.*
+
+### Settings
+![Settings panel showing LOCKDOWN MODE and library directory](assets/Settings_menu.png)
+*LOCKDOWN MODE is on by default — one toggle controls all network access. Point the app at any folder and it scans immediately.*
 
 ---
 
